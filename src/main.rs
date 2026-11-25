@@ -139,6 +139,9 @@ enum Cmd {
         tid: i64,
         #[arg(long)]
         out: Option<PathBuf>,
+        /// 本地缓存没有时按 URL 下载（微信 UA，可能只拿到缩放版）
+        #[arg(long)]
+        fetch: bool,
         /// all | image | video
         #[arg(long, default_value = "all")]
         kind: String,
@@ -597,7 +600,12 @@ fn run() -> Result<()> {
                 );
             }
         }
-        Cmd::MomentMedia { tid, out, kind } => {
+        Cmd::MomentMedia {
+            tid,
+            out,
+            fetch,
+            kind,
+        } => {
             let Some(m) = moment::moment(&ctx, *tid)? else {
                 println!("没有 tid={tid} 的朋友圈");
                 return Ok(());
@@ -635,11 +643,50 @@ fn run() -> Result<()> {
                             ok += 1;
                         }
                         None => {
-                            println!(
-                                "[miss] image #{} 期望 {}x{} / {}B，缓存里无匹配（或存在歧义）",
-                                idx, it.width, it.height, it.size
-                            );
-                            miss += 1;
+                            if *fetch && !it.url.is_empty() {
+                                match moment::fetch_bytes(&it.url) {
+                                    Ok(bytes)
+                                        if moment::is_placeholder(&bytes, it.width, it.height) =>
+                                    {
+                                        println!(
+                                            "[miss] image #{} CDN 返回「暂时无法查看」占位图（链接需会话态或已过期）；在微信里查看一次可写入本地缓存",
+                                            idx
+                                        );
+                                        miss += 1;
+                                    }
+                                    Ok(bytes) => {
+                                        let ext = media::container_ext(&bytes);
+                                        let dims = moment::image_dims(&bytes);
+                                        let dst = out_dir
+                                            .join(format!("{}_{}_{}.{}", m.tid, "image", idx, ext));
+                                        std::fs::write(&dst, &bytes)?;
+                                        println!(
+                                            "[fetch] image #{} -> {}（{} 字节，{:?}，源 URL 期望 {}x{}）",
+                                            idx,
+                                            dst.display(),
+                                            bytes.len(),
+                                            dims,
+                                            it.width,
+                                            it.height
+                                        );
+                                        ok += 1;
+                                    }
+                                    Err(e) => {
+                                        println!("[miss] image #{} 远端拉取失败：{e}", idx);
+                                        miss += 1;
+                                    }
+                                }
+                            } else {
+                                println!(
+                                    "[miss] image #{} 期望 {}x{} / {}B，缓存里无匹配（或存在歧义）{}",
+                                    idx,
+                                    it.width,
+                                    it.height,
+                                    it.size,
+                                    if it.url.is_empty() { "，且没有 URL" } else { "，可加 --fetch" }
+                                );
+                                miss += 1;
+                            }
                         }
                     }
                 }
@@ -674,8 +721,34 @@ fn run() -> Result<()> {
                             ok += 1;
                         }
                         None => {
-                            println!("[miss] video #{} 期望 {}B，缓存里无匹配", idx, it.size);
-                            miss += 1;
+                            if *fetch && !it.url.is_empty() {
+                                match moment::fetch_bytes(&it.url) {
+                                    Ok(bytes) => {
+                                        let ext = media::container_ext(&bytes);
+                                        let dst = out_dir
+                                            .join(format!("{}_{}_{}.{}", m.tid, "video", idx, ext));
+                                        std::fs::write(&dst, &bytes)?;
+                                        println!(
+                                            "[fetch] video #{} -> {}（{} 字节，期望 {}B）",
+                                            idx,
+                                            dst.display(),
+                                            bytes.len(),
+                                            it.size
+                                        );
+                                        ok += 1;
+                                    }
+                                    Err(e) => {
+                                        println!("[miss] video #{} 远端拉取失败：{e}", idx);
+                                        miss += 1;
+                                    }
+                                }
+                            } else {
+                                println!(
+                                    "[miss] video #{} 期望 {}B，缓存里无匹配（可加 --fetch）",
+                                    idx, it.size
+                                );
+                                miss += 1;
+                            }
                         }
                     }
                 }

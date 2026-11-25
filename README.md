@@ -29,6 +29,7 @@
 | 文件 | 按 XML 原名 + 长度在 `msg/file` 下匹配（含 `(n)` 副本） |
 | 朋友圈 | `sns.db` 时间线解析（正文/图片/视频/点赞/评论） |
 | 朋友圈媒体 | Sns 缓存文件名是不透明 key，按**宽高精确匹配 + 明文尺寸消歧**（歧义拒绝），解密后导出 |
+| 远端兜底 | `moment-media --fetch` 带微信 UA + Referer 拉 URL；CDN 多数情况只返回「暂时无法查看」占位图或 400，代码会**识别并报错**，不会保存占位图 |
 | 互动通知 | `SnsMessage_tmp3`（他人对我的赞/评论，含未读数） |
 | 采集 Collector | `collect messages` 增量续采（游标 + 检查点）、维度快照；JSONL / SQLite sink |
 | 监听 Tailer | `tail --chat/--all`，JSONL 事件、检查点续传、缺口启发式 |
@@ -43,8 +44,8 @@
 
 | 阶段 | 内容 |
 |---|---|
-| M8 | 朋友圈远端媒体拉取（`sns` 缓存没有时按 URL 下载；可能需会话态） |
 | M9 | 打包发布：README 示例、Release 二进制、CI |
+| — | 远端媒体：已验证需会话态/签名，直连只能拿到占位图；不再投入 |
 
 ## 用法
 
@@ -69,7 +70,8 @@ $B media wxid_xxx --kind voice --out ./voice
 $B moments --limit 20                 # 朋友圈时间线
 $B moments --me --json                # 只看自己（JSON）
 $B interactions --unread              # 未读赞/评论
-$B moment-media -3384355768585342428 --out ./sns   # 按宽高匹配本地缓存并解密
+$B moment-media -3384355768585342428 --out ./sns          # 本地缓存（推荐）
+$B moment-media -3384355768585342428 --fetch --out ./sns  # 缓存缺失时尝试远端
 
 # 增量采集（断点续采；--full 从头重采）
 $B collect messages --all --out msgs.jsonl --state state.json
@@ -136,6 +138,7 @@ src/
 | 文件导出 | 有 | 有（按原名+长度，32B 文本） |
 | 朋友圈 | 13 条 | 13 条，8 个字段逐条一致（含图片 md5） |
 | 朋友圈图片 | 需显式传 key 才能解 | 5 条动态的图片导出成功；与 Python 选中的缓存文件 **sha256 相同** |
+| 朋友圈远端 | 支持 URL 拉取 | 实测：`shmmsns` 返回 120x120「暂时无法查看」占位图；`wxapp`/视频 CDN 返回 400 |
 | 互动通知 | 2 条 | 2 条一致 |
 
 ## 图片密钥是怎么拿到的

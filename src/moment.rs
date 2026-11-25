@@ -138,10 +138,7 @@ fn parse_user_comment(block: &str) -> UserComment {
 }
 
 fn parse_media(block: &str) -> MediaItem {
-    let url = tag_with_attrs(block, "url")
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let url = html_unescape(tag_with_attrs(block, "url").unwrap_or("").trim());
     let md5 = attr(block, "videomd5")
         .or_else(|| attr(block, "md5"))
         .unwrap_or("")
@@ -452,6 +449,51 @@ mod tests {
         let m = parse_feed(xml);
         assert_eq!(m.videos.len(), 1, "{:?}", m.images);
     }
+}
+
+/// 微信 CDN 对"直连但无会话态/已过期"的图片会返回 `暂时无法查看` 占位图
+/// （PNG 120x120，固定 5093 字节）。拿到它不能当成功。
+pub fn is_placeholder(bytes: &[u8], want_w: u32, want_h: u32) -> bool {
+    if !bytes.starts_with(b"\x89PNG") {
+        return false;
+    }
+    match image_dims(bytes) {
+        Some((w, h)) => w <= 120 && h <= 120 && (want_w > 240 || want_h > 240),
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 远端媒体（朋友圈图片/视频 URL）
+// ---------------------------------------------------------------------------
+
+/// 微信 CDN 只认微信 UA；缺了它一律 400（实测）。
+pub const WECHAT_UA: &str = "MicroMessenger/8.0.50.2701(0x28003250) Windows";
+
+/// 按 URL 拉取原始字节（带微信 UA 与 Referer，跟随重定向，上限 64MB）。
+pub fn fetch_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    if url.is_empty() {
+        anyhow::bail!("URL 为空");
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(30))
+        .user_agent(WECHAT_UA)
+        .build();
+    let resp = agent
+        .get(url)
+        .set("Referer", "https://servicewechat.com/")
+        .call()
+        .map_err(|e| anyhow::anyhow!("请求失败：{e}"))?;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(64 * 1024 * 1024)
+        .read_to_end(&mut buf)?;
+    if buf.is_empty() {
+        anyhow::bail!("响应为空");
+    }
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------

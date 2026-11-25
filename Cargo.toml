@@ -1,6 +1,6 @@
 [package]
 name = "wx_db_rs"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "微信 4.x 本地数据库读取器（SQLCipher4 解密 + 查询），wechatauto 读库部分的 Rust 重写"
 license = "Apache-2.0"
@@ -26,4 +26,5 @@ md-5 = "0.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 zstd = "0.13"
 chrono = "0.4"
+ureq = "2"
 libc = "0.2"
