@@ -54,7 +54,7 @@ pub fn type_name(t: i64) -> String {
 }
 
 /// 正文归一化：文本 / zstd 长文本 / 二进制占位。
-fn friendly_content(v: ValueRef<'_>, kind: &str) -> String {
+pub(crate) fn friendly_content(v: ValueRef<'_>, kind: &str) -> String {
     let placeholder = format!("[{kind}]");
     let bytes: Option<&[u8]> = match v {
         ValueRef::Text(b) | ValueRef::Blob(b) => Some(b),

@@ -556,3 +556,296 @@ mod tests {
         assert!(extract_md5("<msg/>").is_none());
     }
 }
+
+// ---------------------------------------------------------------------------
+// 语音 / 视频 / 文件
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct MediaRow {
+    pub local_id: i64,
+    pub local_type: i64,
+    pub server_id: i64,
+    pub create_time: i64,
+    pub content: String,
+    pub packed_info: Vec<u8>,
+}
+
+/// 按 (chat, local_id) 在消息分片里找回原始行（含 server_id / packed_info）。
+pub fn find_media_row(
+    store: &crate::store::Store,
+    keys: &std::collections::HashMap<String, [u8; 32]>,
+    dbs: &[crate::paths::DbFile],
+    chat: &str,
+    local_id: i64,
+) -> Option<MediaRow> {
+    use rusqlite::OptionalExtension;
+    let table = format!("Msg_{:x}", md5::Md5::digest(chat.as_bytes()));
+    for db in dbs {
+        let base = db.rel.rsplit('/').next().unwrap_or("");
+        if !db.rel.starts_with("message/") || !base.starts_with("message_") {
+            continue;
+        }
+        let Some(key) = keys.get(&db.rel) else {
+            continue;
+        };
+        let Ok(path) = store.ensure(&db.path, &db.rel, key) else {
+            continue;
+        };
+        let Ok(conn) = crate::store::open_ro(&path) else {
+            continue;
+        };
+        let sql = format!(
+            "SELECT local_id, local_type, server_id, create_time, message_content, packed_info_data \
+             FROM \"{table}\" WHERE local_id=?1 LIMIT 1"
+        );
+        let row: Option<(i64, i64, i64, i64, rusqlite::types::Value, Vec<u8>)> = conn
+            .query_row(&sql, [local_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    r.get(4)?,
+                    r.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default(),
+                ))
+            })
+            .optional()
+            .ok()?;
+        if let Some((lid, lt, sid, ct, content, packed)) = row {
+            let kind = crate::query::type_name(lt);
+            let text = match content {
+                rusqlite::types::Value::Blob(b) => {
+                    crate::query::friendly_content(rusqlite::types::ValueRef::Blob(&b), &kind)
+                }
+                rusqlite::types::Value::Text(t) => crate::query::friendly_content(
+                    rusqlite::types::ValueRef::Text(t.as_bytes()),
+                    &kind,
+                ),
+                _ => String::new(),
+            };
+            return Some(MediaRow {
+                local_id: lid,
+                local_type: lt,
+                server_id: sid,
+                create_time: ct,
+                content: text,
+                packed_info: packed,
+            });
+        }
+    }
+    None
+}
+
+/// 语音：`media_*.db` 的 `VoiceInfo.voice_data`（SILK），落盘 `.silk`。
+///
+/// 只有**在界面播放/接收过**的语音才会写进 VoiceInfo；拿不到不是读库坏了。
+pub fn export_voice(
+    store: &crate::store::Store,
+    keys: &std::collections::HashMap<String, [u8; 32]>,
+    dbs: &[crate::paths::DbFile],
+    chat: &str,
+    row: &MediaRow,
+    out_dir: &Path,
+) -> Option<PathBuf> {
+    use rusqlite::OptionalExtension;
+    if row.server_id == 0 {
+        return None;
+    }
+    for db in dbs {
+        let base = db.rel.rsplit('/').next().unwrap_or("");
+        if !base.starts_with("media_") {
+            continue;
+        }
+        let Some(key) = keys.get(&db.rel) else {
+            continue;
+        };
+        let Ok(path) = store.ensure(&db.path, &db.rel, key) else {
+            continue;
+        };
+        let Ok(conn) = crate::store::open_ro(&path) else {
+            continue;
+        };
+        let chat_id: Option<i64> = conn
+            .query_row(
+                "SELECT rowid FROM Name2Id WHERE user_name=?1",
+                [chat],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()?;
+        let Some(cid) = chat_id else { continue };
+        let data: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT voice_data FROM VoiceInfo WHERE chat_name_id=?1 AND svr_id=?2 \
+                 ORDER BY create_time DESC LIMIT 1",
+                rusqlite::params![cid, row.server_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()?;
+        if let Some(b) = data {
+            if b.is_empty() {
+                continue;
+            }
+            let _ = std::fs::create_dir_all(out_dir);
+            let dst = out_dir.join(format!("{}_{}.silk", chat, row.local_id));
+            std::fs::write(&dst, &b).ok()?;
+            return Some(dst);
+        }
+    }
+    None
+}
+
+/// 从 `packed_info` 里取 32 位十六进制 id（视频文件名）。
+pub fn extract_hex32(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 32 {
+        return None;
+    }
+    for w in bytes.windows(32) {
+        if w.iter().all(|b| b.is_ascii_hexdigit()) {
+            return Some(String::from_utf8_lossy(w).to_string().to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn find_in_tree(root: &Path, pred: impl Fn(&str) -> bool) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if pred(name) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// 视频：按 packed_info 里的 id 在 `msg/video` 下找 `<id>.mp4`。
+pub fn export_video(
+    account_dir: &Path,
+    chat: &str,
+    row: &MediaRow,
+    out_dir: &Path,
+) -> Option<PathBuf> {
+    let vid = extract_hex32(&row.packed_info)?;
+    let target = format!("{vid}.mp4");
+    let src = find_in_tree(&account_dir.join("msg").join("video"), |n| n == target)?;
+    let _ = std::fs::create_dir_all(out_dir);
+    let dst = out_dir.join(format!("{}_{}.mp4", chat, row.local_id));
+    std::fs::copy(&src, &dst).ok()?;
+    Some(dst)
+}
+
+/// 从文件消息 XML 里取 `<title>`（原名）与 `<totallen>`（长度）。
+pub fn file_meta(content: &str) -> Option<(String, Option<u64>)> {
+    fn tag<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        let i = s.find(&open)? + open.len();
+        let j = s[i..].find(&close)? + i;
+        Some(&s[i..j])
+    }
+    let title = tag(content, "title")?.trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let size = tag(content, "totallen").and_then(|v| v.trim().parse::<u64>().ok());
+    Some((title, size))
+}
+
+/// 文件：`msg/file/<YYYY-MM>/<原名>`；同名带 `(n)` 后缀的也算，长度能对上优先。
+pub fn export_file(
+    account_dir: &Path,
+    chat: &str,
+    row: &MediaRow,
+    out_dir: &Path,
+) -> Option<PathBuf> {
+    let (name, want_size) = file_meta(&row.content)?;
+    let stem_ext: Vec<&str> = name.rsplitn(2, '.').collect();
+    let (stem, ext) = if stem_ext.len() == 2 {
+        (stem_ext[1], stem_ext[0])
+    } else {
+        (name.as_str(), "")
+    };
+    let family = |n: &str| -> bool {
+        if n == name {
+            return true;
+        }
+        let prefix = format!("{stem}(");
+        let suffix = if ext.is_empty() {
+            ")".to_string()
+        } else {
+            format!(").{ext}")
+        };
+        n.starts_with(&prefix) && n.ends_with(&suffix)
+    };
+    let base = account_dir.join("msg").join("file");
+    let mut stack = vec![base];
+    let mut candidates = Vec::new();
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if family(n) {
+                let sz = p.metadata().map(|m| m.len()).unwrap_or(0);
+                candidates.push((p, sz));
+            }
+        }
+    }
+    let chosen = match want_size {
+        Some(w) => candidates.into_iter().find(|(_, sz)| *sz == w),
+        None => {
+            if candidates.len() == 1 {
+                candidates.pop()
+            } else {
+                None
+            }
+        }
+    }?;
+    let _ = std::fs::create_dir_all(out_dir);
+    let dst = out_dir.join(format!("{}_{}_{}", chat, row.local_id, name));
+    std::fs::copy(&chosen.0, &dst).ok()?;
+    Some(dst)
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+
+    #[test]
+    fn hex32_from_packed_info() {
+        let mut pi = vec![0x08, 0x47, 0x10, 0x06, 0x22, 0x22, 0x42, 0x20];
+        pi.extend_from_slice(b"548641f67d05e39da14dd4a41ca4c55f");
+        assert_eq!(
+            extract_hex32(&pi).as_deref(),
+            Some("548641f67d05e39da14dd4a41ca4c55f")
+        );
+        assert!(extract_hex32(b"short").is_none());
+    }
+
+    #[test]
+    fn file_meta_parses_title_and_size() {
+        let xml = "<msg><appmsg><title>报告.pdf</title><totallen>1234</totallen></appmsg></msg>";
+        assert_eq!(file_meta(xml), Some(("报告.pdf".to_string(), Some(1234))));
+        assert!(file_meta("<msg></msg>").is_none());
+    }
+}

@@ -71,6 +71,17 @@ enum Cmd {
     Members { group: String },
     /// 标签列表
     Labels,
+    /// 导出语音/视频/文件（按消息类型分发）
+    Media {
+        chat: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// all | voice | video | file
+        #[arg(long, default_value = "all")]
+        kind: String,
+    },
     /// 直接解密一个本地 .dat（不依赖消息库）
     DecryptDat {
         path: PathBuf,
@@ -285,6 +296,98 @@ fn run() -> Result<()> {
                 }
                 println!("共 {} 个标签", rows.len());
             }
+        }
+        Cmd::Media {
+            chat,
+            limit,
+            out,
+            kind,
+        } => {
+            let out_dir = out
+                .clone()
+                .unwrap_or_else(|| paths::cache_root().join("media").join(&ctx.account));
+            std::fs::create_dir_all(&out_dir)?;
+            let rows = query::messages(&ctx, chat, 2000)?;
+            let want = |k: &str| match kind.as_str() {
+                "voice" => k == "语音",
+                "video" => k == "视频",
+                "file" => k == "文件/链接/卡片",
+                _ => matches!(k, "语音" | "视频" | "文件/链接/卡片"),
+            };
+            let mut picked: Vec<&model::Message> =
+                rows.iter().filter(|m| want(&m.kind)).take(*limit).collect();
+            picked.reverse();
+            if picked.is_empty() {
+                println!("{} 最近 2000 条里没有匹配的媒体消息（kind={}）", chat, kind);
+            }
+            let (mut ok, mut miss) = (0usize, 0usize);
+            for m in picked {
+                let Some(row) =
+                    media::find_media_row(&ctx.store, &ctx.keys, &ctx.dbs, chat, m.local_id)
+                else {
+                    println!("[skip] {} 找不到原始行", m.local_id);
+                    continue;
+                };
+                match crate::query::type_name(row.local_type).as_str() {
+                    "语音" => match media::export_voice(
+                        &ctx.store, &ctx.keys, &ctx.dbs, chat, &row, &out_dir,
+                    ) {
+                        Some(p) => {
+                            println!(
+                                "[ok] 语音 {} -> {}（{} 字节）",
+                                m.local_id,
+                                p.display(),
+                                std::fs::metadata(&p).map(|x| x.len()).unwrap_or(0)
+                            );
+                            ok += 1;
+                        }
+                        None => {
+                            println!(
+                                "[miss] 语音 {} 无本地音频（未在微信播放/接收过）",
+                                m.local_id
+                            );
+                            miss += 1;
+                        }
+                    },
+                    "视频" => match media::export_video(&ctx.account_dir, chat, &row, &out_dir) {
+                        Some(p) => {
+                            println!(
+                                "[ok] 视频 {} -> {}（{} 字节）",
+                                m.local_id,
+                                p.display(),
+                                std::fs::metadata(&p).map(|x| x.len()).unwrap_or(0)
+                            );
+                            ok += 1;
+                        }
+                        None => {
+                            println!(
+                                "[miss] 视频 {} 本机没有 mp4（只有缩略图或未下载）",
+                                m.local_id
+                            );
+                            miss += 1;
+                        }
+                    },
+                    _ => match media::export_file(&ctx.account_dir, chat, &row, &out_dir) {
+                        Some(p) => {
+                            println!(
+                                "[ok] 文件 {} -> {}（{} 字节）",
+                                m.local_id,
+                                p.display(),
+                                std::fs::metadata(&p).map(|x| x.len()).unwrap_or(0)
+                            );
+                            ok += 1;
+                        }
+                        None => {
+                            println!(
+                                "[miss] 文件 {} 在 msg/file 下找不到匹配（原名/长度）",
+                                m.local_id
+                            );
+                            miss += 1;
+                        }
+                    },
+                }
+            }
+            println!("完成：导出 {ok}，未找到 {miss} -> {}", out_dir.display());
         }
         Cmd::DecryptDat { path, out } => {
             let data = std::fs::read(path)?;
