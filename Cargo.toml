@@ -1,0 +1,29 @@
+[package]
+name = "wx_db_rs"
+version = "0.1.0"
+edition = "2021"
+description = "微信 4.x 本地数据库读取器（SQLCipher4 解密 + 查询），wechatauto 读库部分的 Rust 重写"
+license = "Apache-2.0"
+
+[[bin]]
+name = "wx_db_rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+memchr = "2"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+aes = "0.8"
+cbc = "0.1"
+cipher = "0.4"
+md-5 = "0.10"
+rusqlite = { version = "0.31", features = ["bundled"] }
+zstd = "0.13"
+chrono = "0.4"
+libc = "0.2"
