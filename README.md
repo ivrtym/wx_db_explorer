@@ -55,6 +55,7 @@ tar -xzf wx_db_explorer-0.9.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 - 单文件二进制（已 strip，约 5.8 MB）；SQLite 静态编入，**不依赖系统 libsqlite3**
+- 仅支持 Linux；其它平台会明确报 `compile_error!`
 - 动态链接 glibc；需要完全静态版可
   `cargo build --release --target x86_64-unknown-linux-musl`
 - 重新打包：`sh scripts/release.sh` → `dist/wx_db_explorer-<ver>-<target>.tar.gz`
@@ -163,7 +164,8 @@ Linux 的 Config 布局与 Windows 不同（cipher 在 `cfg+0x98`，Windows 是 
 
 ## 运行要求
 
-- Linux（用到 `/proc/<pid>/mem` 与 Unix 权限位）；Windows 端待补。
+- **仅 Linux**（`/proc/<pid>/mem` + Unix 权限位）。在 Windows/macOS 上会直接触发
+  `compile_error!` 并说明原因，而不是编译出一堆无关错误。
 - 首次取密钥需要 root 或 `CAP_SYS_PTRACE`（或 `ptrace_scope=0`），之后走缓存。
 - 只读：不 `WriteProcessMemory`、不写微信目录。
 

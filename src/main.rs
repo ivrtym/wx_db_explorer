@@ -5,6 +5,13 @@
 //!
 //! 尚未移植：WAL 合并、媒体解密、朋友圈、监听。详见 README。
 
+// 本项目依赖 Linux 专有接口：/proc/<pid>/mem、Unix 权限位。
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "wx_db_explorer 目前仅支持 Linux。它通过 /proc/<pid>/mem 读取微信进程内存、\
+     并使用 Unix 权限位保护密钥缓存；Windows/macOS 支持尚未实现。"
+);
+
 mod crypto;
 mod keys;
 mod media;
