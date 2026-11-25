@@ -221,3 +221,10 @@ pub fn exists(p: &Path) -> bool {
 pub fn context_msg<T>(r: Result<T>, msg: &str) -> Result<T> {
     r.with_context(|| msg.to_string())
 }
+
+/// `<db>-wal` 旁挂文件路径。
+pub fn wal_sidecar(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_os_string();
+    s.push("-wal");
+    PathBuf::from(s)
+}

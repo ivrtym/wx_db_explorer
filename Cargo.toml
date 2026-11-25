@@ -1,6 +1,6 @@
 [package]
 name = "wx_db_rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "微信 4.x 本地数据库读取器（SQLCipher4 解密 + 查询），wechatauto 读库部分的 Rust 重写"
 license = "Apache-2.0"

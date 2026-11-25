@@ -133,6 +133,12 @@ fn run() -> Result<()> {
             println!("wxid    : {}", ctx.wxid);
             println!("db_files: {}", ctx.dbs.len());
             println!("keys_ok : {}/{}", ctx.available(), ctx.dbs.len());
+            let wal_n = ctx
+                .dbs
+                .iter()
+                .filter(|d| paths::wal_sidecar(&d.path).exists())
+                .count();
+            println!("wal     : {} 个库有 -wal（启动时合并）", wal_n);
             println!("cache   : {}", ctx.store.dir().display());
             let missing: Vec<&str> = ctx
                 .dbs

@@ -5,7 +5,7 @@ use crate::paths::DbFile;
 use crate::store::Store;
 use anyhow::{anyhow, Result};
 use md5::{Digest, Md5};
-use rusqlite::{types::ValueRef, Connection, OpenFlags};
+use rusqlite::{types::ValueRef, Connection};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -114,10 +114,7 @@ impl Ctx {
             .get(rel)
             .ok_or_else(|| anyhow!("没有 {rel} 的可用密钥"))?;
         let path = self.store.ensure(&db.path, &db.rel, key)?;
-        Ok(Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?)
+        crate::store::open_ro(&path)
     }
 
     pub fn available(&self) -> usize {
