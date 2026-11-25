@@ -4,6 +4,12 @@ version = "0.9.1"
 edition = "2021"
 description = "微信 4.x 本地数据库读取器（SQLCipher4 解密 + 查询），wechatauto 读库部分的 Rust 重写"
 license = "Apache-2.0"
+repository = "https://github.com/ivrtym/wx_db_explorer"
+homepage = "https://github.com/ivrtym/wx_db_explorer"
+readme = "README.md"
+rust-version = "1.75"
+keywords = ["wechat", "sqlcipher", "database", "linux", "cli"]
+categories = ["command-line-utilities", "database"]
 
 [[bin]]
 name = "wx_db_explorer"

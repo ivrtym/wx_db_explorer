@@ -49,9 +49,11 @@
 
 ## 安装 / 分发
 
+预编译包在 GitHub Releases：<https://github.com/ivrtym/wx_db_explorer/releases>
+
 ```bash
-tar -xzf wx_db_explorer-0.9.0-x86_64-unknown-linux-gnu.tar.gz
-./wx_db_explorer-0.9.0-x86_64-unknown-linux-gnu/wx_db_explorer doctor
+tar -xzf wx_db_explorer-0.9.1-x86_64-unknown-linux-gnu.tar.gz
+./wx_db_explorer-0.9.1-x86_64-unknown-linux-gnu/wx_db_explorer doctor
 ```
 
 - 单文件二进制（已 strip，约 5.8 MB）；SQLite 静态编入，**不依赖系统 libsqlite3**
