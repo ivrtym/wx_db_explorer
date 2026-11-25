@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "wx_db_explorer",
     version,
-    about = "微信 4.x 本地数据库读取器（Rust）"
+    about = "微信 4.x 本地数据库探索器（读取 / 媒体 / 朋友圈 / 采集）"
 )]
 struct Cli {
     /// 显式指定 xwechat_files 根目录
@@ -163,7 +163,7 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// 检测/刷新图片密钥（需要先在本机打开过一张图片）
+    /// 检测/刷新图片密钥（优先 cfgDword 派生，无需打开图片）
     ImageKey {
         #[arg(long)]
         refresh: bool,
