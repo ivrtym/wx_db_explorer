@@ -20,7 +20,7 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use query::Ctx;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -96,6 +96,9 @@ enum Cmd {
         /// 逗号分隔的消息类型（如 文本,图片）
         #[arg(long)]
         kinds: Option<String>,
+        /// diff 时把当前快照写回检查点
+        #[arg(long)]
+        update: bool,
     },
     /// 准实时监听新消息（JSONL 事件），`--once` 只轮询一次
     Tail {
@@ -377,8 +380,9 @@ fn run() -> Result<()> {
             batch,
             full,
             kinds,
+            update,
         } => {
-            if !*all && chat.is_none() && dataset == "messages" {
+            if dataset == "messages" && !*all && chat.is_none() {
                 return Err(anyhow!("messages 采集请给 --chat 或 --all"));
             }
             let out_path = out.clone().unwrap_or_else(|| {
@@ -393,20 +397,17 @@ fn run() -> Result<()> {
                     .join(&ctx.account)
                     .join(format!("{dataset}.json"))
             });
-            if dataset == "messages" && *full {
-                // --full：从零重采，清掉旧导出与游标
-                let _ = std::fs::remove_file(&out_path);
-                let _ = std::fs::remove_file(&state_path);
-            }
-            let mut sink: Box<dyn sync::Sink> = if out_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e == "db" || e == "sqlite")
-                .unwrap_or(false)
-            {
-                Box::new(sync::SqliteSink::create(&out_path)?)
-            } else {
-                Box::new(sync::JsonlSink::create(&out_path)?)
+            let make = |p: &Path| -> Result<Box<dyn sync::Sink>> {
+                let sqlite = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e == "db" || e == "sqlite")
+                    .unwrap_or(false);
+                Ok(if sqlite {
+                    Box::new(sync::SqliteSink::create(p)?)
+                } else {
+                    Box::new(sync::JsonlSink::create(p)?)
+                })
             };
             let kind_set = kinds.as_ref().map(|k| {
                 k.split(',')
@@ -414,8 +415,13 @@ fn run() -> Result<()> {
                     .filter(|s| !s.is_empty())
                     .collect::<std::collections::HashSet<_>>()
             });
-            let n = match dataset.as_str() {
+
+            match dataset.as_str() {
                 "messages" => {
+                    if *full && out.is_some() {
+                        let _ = std::fs::remove_file(&out_path);
+                    }
+                    let mut sink = make(&out_path)?;
                     let chats = if *all {
                         None
                     } else {
@@ -438,40 +444,68 @@ fn run() -> Result<()> {
                         out_path.display(),
                         state_path.display()
                     );
-                    rep.rows
                 }
-                "moments" => {
-                    let mut n = 0usize;
-                    for m in moment::moments(&ctx, 5000, 0, false, None)? {
-                        sink.write("moments", &m.id, &serde_json::to_value(&m)?)?;
-                        n += 1;
+                "moments" | "interactions" => {
+                    if *full && out.is_some() {
+                        let _ = std::fs::remove_file(&out_path);
                     }
-                    sink.flush()?;
-                    n
+                    let mut sink = make(&out_path)?;
+                    let n = if dataset == "moments" {
+                        sync::collect_moments(&ctx, sink.as_mut(), &state_path, *full)?
+                    } else {
+                        sync::collect_interactions(&ctx, sink.as_mut(), &state_path, *full)?
+                    };
+                    println!(
+                        "{}: {} 条 -> {}（state {}）",
+                        dataset,
+                        n,
+                        out_path.display(),
+                        state_path.display()
+                    );
                 }
-                "interactions" => {
-                    let mut n = 0usize;
-                    for i in moment::interactions(&ctx, 5000, false)? {
-                        sink.write(
-                            "interactions",
-                            &i.local_id.to_string(),
-                            &serde_json::to_value(&i)?,
-                        )?;
-                        n += 1;
+                "diff" => {
+                    let diffs = if out.is_some() {
+                        let mut sink = make(&out_path)?;
+                        sync::collect_diff(&ctx, &state_path, Some(sink.as_mut()), *update)?
+                    } else {
+                        sync::collect_diff(&ctx, &state_path, None, *update)?
+                    };
+                    let mut total = 0usize;
+                    for d in &diffs {
+                        total += d.added.len() + d.removed.len() + d.changed.len();
+                        println!(
+                            "{:<10} +{} -{} ~{}",
+                            d.dataset,
+                            d.added.len(),
+                            d.removed.len(),
+                            d.changed.len()
+                        );
+                        for k in d.added.iter().take(5) {
+                            println!("   + {k}");
+                        }
+                        for k in d.removed.iter().take(5) {
+                            println!("   - {k}");
+                        }
+                        for k in d.changed.iter().take(5) {
+                            println!("   ~ {k}");
+                        }
                     }
-                    sink.flush()?;
-                    n
+                    println!(
+                        "共 {} 处变更{} -> {}",
+                        total,
+                        if *update {
+                            "（已写回检查点）"
+                        } else {
+                            ""
+                        },
+                        state_path.display()
+                    );
                 }
-                other => sync::collect_dimension(&ctx, other, sink.as_mut())?,
-            };
-            if dataset.as_str() != "messages" {
-                println!(
-                    "{}: {} 条 -> {}（state {}）",
-                    dataset,
-                    n,
-                    out_path.display(),
-                    state_path.display()
-                );
+                other => {
+                    let mut sink = make(&out_path)?;
+                    let n = sync::collect_dimension(&ctx, other, sink.as_mut())?;
+                    println!("{}: {} 条 -> {}", other, n, out_path.display());
+                }
             }
         }
         Cmd::Tail {

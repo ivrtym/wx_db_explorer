@@ -26,6 +26,13 @@ pub struct Checkpoint {
     pub version: u32,
     pub epoch: u64,
     pub cursors: HashMap<String, Cursor>,
+    #[serde(default)]
+    pub moment_tid: Option<i64>,
+    #[serde(default)]
+    pub interaction_id: Option<i64>,
+    /// 维度快照：dataset -> {自然键: 行哈希}
+    #[serde(default)]
+    pub dim_keys: HashMap<String, HashMap<String, String>>,
     pub updated_at: i64,
 }
 
@@ -448,4 +455,238 @@ mod tests {
         assert!(is_gap(1000, 1000 + GAP_MS + 1));
         assert!(!is_gap(1000, 900));
     }
+}
+
+// ---------------------------------------------------------------------------
+// 朋友圈 / 互动增量
+// ---------------------------------------------------------------------------
+
+pub fn collect_moments(ctx: &Ctx, sink: &mut dyn Sink, state: &Path, full: bool) -> Result<usize> {
+    let mut cp = Checkpoint::load(state);
+    cp.epoch = epoch_of(ctx);
+    let mut after = if full {
+        i64::MIN
+    } else {
+        cp.moment_tid.unwrap_or(i64::MIN)
+    };
+    let mut n = 0usize;
+    loop {
+        let rows = crate::moment::moments_after(ctx, after, 500)?;
+        if rows.is_empty() {
+            break;
+        }
+        for m in &rows {
+            sink.write("moments", &m.id, &serde_json::to_value(m)?)?;
+            n += 1;
+            after = after.max(m.tid);
+        }
+        cp.moment_tid = Some(after);
+        cp.save(state)?;
+        if rows.len() < 500 {
+            break;
+        }
+    }
+    sink.flush()?;
+    cp.save(state)?;
+    Ok(n)
+}
+
+pub fn collect_interactions(
+    ctx: &Ctx,
+    sink: &mut dyn Sink,
+    state: &Path,
+    full: bool,
+) -> Result<usize> {
+    let mut cp = Checkpoint::load(state);
+    cp.epoch = epoch_of(ctx);
+    let mut after = if full {
+        0
+    } else {
+        cp.interaction_id.unwrap_or(0)
+    };
+    let mut n = 0usize;
+    loop {
+        let rows = crate::moment::interactions_after(ctx, after, 500)?;
+        if rows.is_empty() {
+            break;
+        }
+        for i in &rows {
+            sink.write(
+                "interactions",
+                &i.local_id.to_string(),
+                &serde_json::to_value(i)?,
+            )?;
+            n += 1;
+            after = after.max(i.local_id);
+        }
+        cp.interaction_id = Some(after);
+        cp.save(state)?;
+        if rows.len() < 500 {
+            break;
+        }
+    }
+    sink.flush()?;
+    cp.save(state)?;
+    Ok(n)
+}
+
+// ---------------------------------------------------------------------------
+// 维度快照与 diff（M7）
+// ---------------------------------------------------------------------------
+
+fn row_hash(parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p.as_bytes());
+        h.update([0u8]);
+    }
+    format!("{:x}", h.finalize())
+}
+
+pub fn dimension_snapshot(ctx: &Ctx) -> Result<HashMap<String, HashMap<String, String>>> {
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+    let mut contacts = HashMap::new();
+    for c in query::contacts(ctx, Some(""), 1_000_000)? {
+        contacts.insert(
+            c.username.clone(),
+            row_hash(&[&c.username, &c.nick_name, &c.remark]),
+        );
+    }
+    out.insert("contacts".into(), contacts);
+
+    let groups_list = query::groups(ctx)?;
+    let mut groups = HashMap::new();
+    let mut members = HashMap::new();
+    for g in &groups_list {
+        groups.insert(
+            g.username.clone(),
+            row_hash(&[&g.username, &g.name, &g.owner, &g.member_count.to_string()]),
+        );
+        for m in query::group_members(ctx, &g.username)? {
+            let key = format!("{}:{}", g.username, m.username);
+            members.insert(
+                key,
+                row_hash(&[
+                    &m.username,
+                    &m.nick_name,
+                    &m.remark,
+                    if m.is_owner { "1" } else { "0" },
+                ]),
+            );
+        }
+    }
+    out.insert("groups".into(), groups);
+    out.insert("members".into(), members);
+
+    let mut labels = HashMap::new();
+    for l in query::labels(ctx)? {
+        labels.insert(
+            l.label_id.to_string(),
+            row_hash(&[&l.name, &l.sort_order.to_string()]),
+        );
+    }
+    out.insert("labels".into(), labels);
+
+    let mut sessions = HashMap::new();
+    for s in query::sessions(ctx, 100_000)? {
+        sessions.insert(
+            s.username.clone(),
+            row_hash(&[
+                &s.username,
+                &s.unread.to_string(),
+                &s.summary,
+                &s.last_time.to_string(),
+            ]),
+        );
+    }
+    out.insert("sessions".into(), sessions);
+
+    Ok(out)
+}
+
+pub struct DimDiff {
+    pub dataset: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<String>,
+}
+
+impl DimDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+pub fn dimension_diff(
+    prev: &HashMap<String, HashMap<String, String>>,
+    cur: &HashMap<String, HashMap<String, String>>,
+) -> Vec<DimDiff> {
+    let mut out = Vec::new();
+    for (dataset, c) in cur {
+        let empty = HashMap::new();
+        let p = prev.get(dataset).unwrap_or(&empty);
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        let mut changed = Vec::new();
+        for (k, v) in c {
+            match p.get(k) {
+                None => added.push(k.clone()),
+                Some(old) if old != v => changed.push(k.clone()),
+                _ => {}
+            }
+        }
+        for k in p.keys() {
+            if !c.contains_key(k) {
+                removed.push(k.clone());
+            }
+        }
+        added.sort();
+        removed.sort();
+        changed.sort();
+        out.push(DimDiff {
+            dataset: dataset.clone(),
+            added,
+            removed,
+            changed,
+        });
+    }
+    out.sort_by(|a, b| a.dataset.cmp(&b.dataset));
+    out
+}
+
+/// 对比并可选更新检查点；返回各数据集的变更。
+pub fn collect_diff(
+    ctx: &Ctx,
+    state: &Path,
+    sink: Option<&mut dyn Sink>,
+    update: bool,
+) -> Result<Vec<DimDiff>> {
+    let mut cp = Checkpoint::load(state);
+    cp.epoch = epoch_of(ctx);
+    let cur = dimension_snapshot(ctx)?;
+    let diffs = dimension_diff(&cp.dim_keys, &cur);
+    if let Some(s) = sink {
+        for d in &diffs {
+            for (change, keys) in [
+                ("added", &d.added),
+                ("removed", &d.removed),
+                ("changed", &d.changed),
+            ] {
+                for k in keys {
+                    let rec = serde_json::json!({
+                        "schema": 1, "dataset": d.dataset, "change": change, "key": k
+                    });
+                    s.write(&format!("diff:{}", d.dataset), k, &rec)?;
+                }
+            }
+        }
+        s.flush()?;
+    }
+    if update {
+        cp.dim_keys = cur;
+        cp.save(state)?;
+    }
+    Ok(diffs)
 }

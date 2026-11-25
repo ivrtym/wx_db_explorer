@@ -250,7 +250,7 @@ fn html_unescape(s: &str) -> String {
 // 查询
 // ---------------------------------------------------------------------------
 
-fn nickname_of(ctx: &Ctx, username: &str) -> String {
+pub fn nickname_of(ctx: &Ctx, username: &str) -> String {
     if username.is_empty() {
         return String::new();
     }
@@ -351,6 +351,54 @@ pub fn interactions(ctx: &Ctx, limit: usize, only_unread: bool) -> Result<Vec<In
             relative_me: r.get::<_, Option<i64>>(11)?.unwrap_or(0) != 0,
             unread: r.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
         });
+    }
+    Ok(out)
+}
+
+/// 增量互动：`local_id > after`，按 local_id 升序。
+pub fn interactions_after(ctx: &Ctx, after: i64, limit: usize) -> Result<Vec<Interaction>> {
+    let conn = ctx.open_public("sns/sns.db")?;
+    let mut stmt = conn.prepare(
+        "SELECT local_id, create_time, type, feed_id, from_username, from_nickname, \
+         to_username, to_nickname, content, comment_id, del_status, is_relative_me, is_unread \
+         FROM SnsMessage_tmp3 WHERE local_id > ?1 ORDER BY local_id ASC LIMIT ?2",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![after, limit as i64])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        out.push(Interaction {
+            local_id: r.get(0)?,
+            create_time: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            kind: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            feed_id: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            from_username: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            from_nickname: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            to_username: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            to_nickname: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            content: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+            comment_id: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+            deleted: r.get::<_, Option<i64>>(10)?.unwrap_or(0) != 0,
+            relative_me: r.get::<_, Option<i64>>(11)?.unwrap_or(0) != 0,
+            unread: r.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
+        });
+    }
+    Ok(out)
+}
+
+/// 增量时间线：`tid > after`，按 tid 升序。
+pub fn moments_after(ctx: &Ctx, after: i64, limit: usize) -> Result<Vec<Moment>> {
+    let conn = ctx.open_public("sns/sns.db")?;
+    let mut stmt = conn
+        .prepare("SELECT tid, content FROM SnsTimeLine WHERE tid > ?1 ORDER BY tid ASC LIMIT ?2")?;
+    let mut rows = stmt.query(rusqlite::params![after, limit as i64])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let tid: i64 = r.get(0)?;
+        let xml: String = r.get::<_, Option<String>>(1)?.unwrap_or_default();
+        let mut m = parse_feed(&xml);
+        m.tid = tid;
+        m.nickname = nickname_of(ctx, &m.username);
+        out.push(m);
     }
     Ok(out)
 }

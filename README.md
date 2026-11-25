@@ -3,7 +3,7 @@
 微信 4.x **本地数据库读取器**的 Rust 实现——`wechatauto` 读库部分的独立重写。
 只读、不注入、不改微信进程；不需要界面，不需要登录窗口。
 
-> 当前状态：**M5 完成**——读 + 媒体 + 朋友圈 + **增量采集 / 准实时监听**。
+> 当前状态：**M7 完成**——读 + 媒体 + 朋友圈 + 增量采集 / 准实时监听 + 维度变更检测。
 > 后续只剩工程化增强（见路线图）。
 
 ---
@@ -32,6 +32,8 @@
 | 互动通知 | `SnsMessage_tmp3`（他人对我的赞/评论，含未读数） |
 | 采集 Collector | `collect messages` 增量续采（游标 + 检查点）、维度快照；JSONL / SQLite sink |
 | 监听 Tailer | `tail --chat/--all`，JSONL 事件、检查点续传、缺口启发式 |
+| 朋友圈增量 | `collect moments|interactions` 按 `tid` / `local_id` 游标续采 |
+| 维度 diff | `collect diff`：联系人/群/成员/标签/会话的**逐键哈希变更**（+/-/~） |
 | 导出 | JSON |
 
 **跳过** `*_fts.db`：WCDB 自定义分词器 `MMFtsTokenizer`，系统 SQLite 打不开，
@@ -41,8 +43,8 @@
 
 | 阶段 | 内容 |
 |---|---|
-| M6 | 朋友圈/互动的增量游标（当前一次性导出）；远端媒体拉取 |
-| M7 | 维度 diff（联系人/群/成员的快照哈希变更检测） |
+| M8 | 朋友圈远端媒体拉取（`sns` 缓存没有时按 URL 下载；可能需会话态） |
+| M9 | 打包发布：README 示例、Release 二进制、CI |
 
 ## 用法
 
@@ -73,7 +75,11 @@ $B moment-media -3384355768585342428 --out ./sns   # 按宽高匹配本地缓存
 $B collect messages --all --out msgs.jsonl --state state.json
 $B collect messages --chat 52764254929@chatroom --since 1795500000 --out one.jsonl
 $B collect contacts --out contacts.jsonl
+$B collect moments --out moments.jsonl        # 按 tid 增量
+$B collect interactions --out it.jsonl        # 按 local_id 增量
 $B collect messages --all --out msgs.db        # 按后缀选 SQLite sink（幂等 upsert）
+$B collect diff --state dim.json               # 看维度变更（+新增 -删除 ~修改）
+$B collect diff --state dim.json --update      # 写回基线
 
 # 准实时监听（JSONL 事件；Ctrl+C 退出，检查点每轮落盘）
 $B tail --chat 52764254929@chatroom --state tail.json
