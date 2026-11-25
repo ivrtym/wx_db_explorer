@@ -7,6 +7,7 @@
 
 mod crypto;
 mod keys;
+mod media;
 mod model;
 mod paths;
 mod proc;
@@ -70,6 +71,28 @@ enum Cmd {
     Members { group: String },
     /// 标签列表
     Labels,
+    /// 直接解密一个本地 .dat（不依赖消息库）
+    DecryptDat {
+        path: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// 检测/刷新图片密钥（需要先在本机打开过一张图片）
+    ImageKey {
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// 解密并导出某个会话的图片
+    Images {
+        chat: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// best | original | mid | thumb
+        #[arg(long, default_value = "best")]
+        tier: String,
+    },
     /// 导出某个会话的消息为 JSON
     Export {
         chat: String,
@@ -93,12 +116,14 @@ fn load_ctx(cli: &Cli) -> Result<Ctx> {
     let acct = paths::pick_account(&root, cli.account.as_deref())?;
     let dbs = paths::db_files(&acct.dir);
     let cache = cli.keys_file.clone().unwrap_or_else(keys::cache_file);
-    let (keys, err) = keys::load_or_extract(&dbs, &cache)?;
+    let (keys, cfg_dwords, err) = keys::load_or_extract(&dbs, &cache)?;
     if let Some(e) = err {
         eprintln!("[wx_db_rs] 密钥提示：{e}");
     }
     Ok(Ctx {
         account: acct.account.clone(),
+        account_dir: acct.dir.clone(),
+        cfg_dwords,
         wxid: acct.wxid(),
         dbs,
         keys,
@@ -139,6 +164,7 @@ fn run() -> Result<()> {
                 .filter(|d| paths::wal_sidecar(&d.path).exists())
                 .count();
             println!("wal     : {} 个库有 -wal（启动时合并）", wal_n);
+            println!("cfg_dw  : {} 个图片密钥派生候选", ctx.cfg_dwords.len());
             println!("cache   : {}", ctx.store.dir().display());
             let missing: Vec<&str> = ctx
                 .dbs
@@ -259,6 +285,144 @@ fn run() -> Result<()> {
                 }
                 println!("共 {} 个标签", rows.len());
             }
+        }
+        Cmd::DecryptDat { path, out } => {
+            let data = std::fs::read(path)?;
+            let key = if media::find_probe(&ctx.account_dir).is_some() {
+                media::resolve_key(&ctx.cfg_dwords, &ctx.wxid, path)
+            } else {
+                None
+            };
+            let aes = key.as_ref().and_then(|k| media::ascii_key(&k.aes_key));
+            let bytes =
+                media::decrypt_dat(&data, aes.as_ref(), key.as_ref().and_then(|k| k.xor_key))?;
+            let ext = media::image_ext(&bytes);
+            match out {
+                Some(p) => {
+                    std::fs::write(p, &bytes)?;
+                    println!(
+                        "已解密 {} → {}（{} 字节，{}）",
+                        path.display(),
+                        p.display(),
+                        bytes.len(),
+                        ext
+                    );
+                }
+                None => println!(
+                    "格式={} 字节={} 头部={:02x?}",
+                    ext,
+                    bytes.len(),
+                    &bytes[..bytes.len().min(8)]
+                ),
+            }
+        }
+        Cmd::ImageKey { refresh } => {
+            let probe = media::find_probe(&ctx.account_dir)
+                .ok_or_else(|| anyhow!("没有 V2 图片样本：请先在微信里点开任意一张图片"))?;
+            println!("probe   : {}", probe.display());
+            let mut k = media::resolve_key(&ctx.cfg_dwords, &ctx.wxid, &probe);
+            if k.is_none() {
+                println!("缓存未命中，尝试在 Config 对象附近反推 cfgDword…");
+                k = media::scan_cfg_dword(&probe, &ctx.wxid, &ctx.account);
+            }
+            if k.is_none() {
+                println!("cfgDword 反推未命中，扫描内存字符串候选（首次可能十几秒）…");
+                k = media::detect_image_key(&probe, *refresh);
+            }
+            let k =
+                k.ok_or_else(|| anyhow!("未找到可用的图片密钥（先在微信里打开任意一张图片再试）"))?;
+            println!("aes_key : {}", k.aes_key);
+            println!("xor_key : {:?}", k.xor_key);
+            println!("cache   : {}", media::key_cache_file().display());
+            if cli.json {
+                print_json(&k)?;
+            }
+        }
+        Cmd::Images {
+            chat,
+            limit,
+            out,
+            tier,
+        } => {
+            let out_dir = out
+                .clone()
+                .unwrap_or_else(|| paths::cache_root().join("media").join(&ctx.account));
+            std::fs::create_dir_all(&out_dir)?;
+            let probe = media::find_probe(&ctx.account_dir)
+                .ok_or_else(|| anyhow!("没有 V2 图片样本：请先在微信里点开任意一张图片"))?;
+            let key = media::resolve_key(&ctx.cfg_dwords, &ctx.wxid, &probe);
+            if key.is_none() {
+                println!("提示：没有可用的图片密钥，本次只列本机副本。");
+                println!("      先在微信里打开任意一张图片，再跑 `wx_db_rs image-key`。");
+            }
+            let aes = key.as_ref().and_then(|k| media::ascii_key(&k.aes_key));
+            let rows = query::messages(&ctx, chat, 2000)?;
+            let mut wanted: Vec<&model::Message> = rows
+                .iter()
+                .filter(|m| m.kind == "图片")
+                .take(*limit)
+                .collect();
+            wanted.reverse(); // 从旧到新
+            if wanted.is_empty() {
+                println!("{} 最近 2000 条里没有图片消息", chat);
+            }
+            let mut ok = 0usize;
+            for m in wanted {
+                let Some(md5) = media::extract_md5(&m.content) else {
+                    println!("[skip] {} 无 md5", m.local_id);
+                    continue;
+                };
+                let files = media::image_files(&ctx.account_dir, chat, &md5);
+                let order: Vec<&str> = if tier == "best" {
+                    media::TIER_ORDER.to_vec()
+                } else {
+                    vec![tier.as_str()]
+                };
+                let chosen = order.iter().find_map(|t| {
+                    files
+                        .get(t)
+                        .filter(|(_, sz)| *sz > 0)
+                        .map(|(p, sz)| (*t, p.clone(), *sz))
+                });
+                let Some((t, path, sz)) = chosen else {
+                    println!(
+                        "[skip] {} {} 本机没有该档副本（有：{}）",
+                        m.local_id,
+                        &md5[..8],
+                        files.keys().cloned().collect::<Vec<_>>().join(",")
+                    );
+                    continue;
+                };
+                if key.is_none() {
+                    println!(
+                        "[list] {} {} tiers={}",
+                        m.local_id,
+                        &md5[..8],
+                        files.keys().cloned().collect::<Vec<_>>().join(",")
+                    );
+                    continue;
+                }
+                let data = std::fs::read(&path)?;
+                match media::decrypt_dat(&data, aes.as_ref(), key.as_ref().and_then(|k| k.xor_key))
+                {
+                    Ok(bytes) => {
+                        let ext = media::image_ext(&bytes);
+                        let dst = out_dir.join(format!("{}_{}.{}", m.local_id, &md5[..8], ext));
+                        std::fs::write(&dst, &bytes)?;
+                        println!(
+                            "[ok] {} {} tier={} {}B -> {}",
+                            m.local_id,
+                            &md5[..8],
+                            t,
+                            sz,
+                            dst.display()
+                        );
+                        ok += 1;
+                    }
+                    Err(e) => println!("[fail] {} {}：{e}", m.local_id, &md5[..8]),
+                }
+            }
+            println!("完成：{ok} 张 -> {}", out_dir.display());
         }
         Cmd::Export { chat, out, limit } => {
             let rows = query::messages(&ctx, chat, *limit)?;

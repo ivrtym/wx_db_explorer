@@ -80,13 +80,24 @@ fn scan_specs(plain: &[u8]) -> Vec<KeySpec> {
     out
 }
 
-/// 从某个 pid 提取所有 keyspec。
-pub fn extract_specs(pid: i32) -> Result<Vec<KeySpec>> {
+/// 一次扫描的产物：库密钥 + 图片密钥派生源（cfg+0x40 的 DWORD）。
+#[derive(Default)]
+pub struct Extracted {
+    pub specs: Vec<KeySpec>,
+    pub cfg_dwords: Vec<u32>,
+    /// Config 对象地址（媒体密钥派生时在附近暴力找偏移）
+    pub cfgs: Vec<u64>,
+}
+
+/// 从某个 pid 提取 keyspec 与 cfg_dword。
+pub fn extract(pid: i32) -> Result<Extracted> {
     let anchors = proc::find_all(pid, ANCHOR)?;
     if anchors.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Extracted::default());
     }
     let mut specs: Vec<KeySpec> = Vec::new();
+    let mut cfg_dwords: Vec<u32> = Vec::new();
+    let mut cfgs: Vec<u64> = Vec::new();
     for a in anchors {
         let mut pair = Vec::with_capacity(16);
         pair.extend_from_slice(&a.to_le_bytes());
@@ -114,6 +125,16 @@ pub fn extract_specs(pid: i32) -> Result<Vec<KeySpec>> {
             if cfg < 0x10000 {
                 continue;
             }
+            if !cfgs.contains(&cfg) {
+                cfgs.push(cfg);
+            }
+            // cfg+0x40 = cfgDword：图片密钥 = MD5(str(cfgDword) + wxid)[:16]，xor = cfgDword & 0xFF
+            if let Some(dw) = proc::read_at(&mut mem, cfg + 0x40, 4) {
+                let v = u32::from_le_bytes(dw[..4].try_into().unwrap());
+                if v != 0 && !cfg_dwords.contains(&v) {
+                    cfg_dwords.push(v);
+                }
+            }
             for off in [0x98u64, 0x88] {
                 let Some(head) = proc::read_at(&mut mem, cfg + off, 0x10) else {
                     continue;
@@ -139,7 +160,11 @@ pub fn extract_specs(pid: i32) -> Result<Vec<KeySpec>> {
             }
         }
     }
-    Ok(specs)
+    Ok(Extracted {
+        specs,
+        cfg_dwords,
+        cfgs,
+    })
 }
 
 fn read_page1(path: &Path) -> Option<Vec<u8>> {
@@ -172,20 +197,23 @@ pub fn match_keys(specs: &[KeySpec], dbs: &[DbFile]) -> HashMap<String, [u8; 32]
 struct KeyCache {
     version: u32,
     keys: HashMap<String, String>,
+    #[serde(default)]
+    cfg_dwords: Vec<u32>,
 }
 
 pub fn cache_file() -> std::path::PathBuf {
     cache_root().join("keys.json")
 }
 
-fn load_cache(path: &Path) -> HashMap<String, [u8; 32]> {
+fn load_cache(path: &Path) -> (HashMap<String, [u8; 32]>, Vec<u32>) {
     let mut out = HashMap::new();
     let Ok(text) = fs::read_to_string(path) else {
-        return out;
+        return (out, Vec::new());
     };
     let Ok(cache) = serde_json::from_str::<KeyCache>(&text) else {
-        return out;
+        return (out, Vec::new());
     };
+    let dwords = cache.cfg_dwords.clone();
     for (rel, hexkey) in cache.keys {
         if let Ok(k) = hex::decode(&hexkey) {
             if k.len() == 32 {
@@ -195,16 +223,17 @@ fn load_cache(path: &Path) -> HashMap<String, [u8; 32]> {
             }
         }
     }
-    out
+    (out, dwords)
 }
 
-fn save_cache(path: &Path, keys: &HashMap<String, [u8; 32]>) {
+fn save_cache(path: &Path, keys: &HashMap<String, [u8; 32]>, dwords: &[u32]) {
     let cache = KeyCache {
         version: 1,
         keys: keys
             .iter()
             .map(|(k, v)| (k.clone(), hex::encode(v)))
             .collect(),
+        cfg_dwords: dwords.to_vec(),
     };
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
@@ -226,9 +255,10 @@ fn save_cache(path: &Path, keys: &HashMap<String, [u8; 32]>) {
 pub fn load_or_extract(
     dbs: &[DbFile],
     cache_path: &Path,
-) -> Result<(HashMap<String, [u8; 32]>, Option<String>)> {
+) -> Result<(HashMap<String, [u8; 32]>, Vec<u32>, Option<String>)> {
     let mut keys = HashMap::new();
-    for (rel, key) in load_cache(cache_path) {
+    let (cached, mut dwords) = load_cache(cache_path);
+    for (rel, key) in cached {
         // 只保留仍能通过页 1 HMAC 的条目
         if let Some(db) = dbs.iter().find(|d| d.rel == rel) {
             if let Some(p1) = read_page1(&db.path) {
@@ -241,21 +271,30 @@ pub fn load_or_extract(
 
     let missing: Vec<&DbFile> = dbs.iter().filter(|d| !keys.contains_key(&d.rel)).collect();
     if missing.is_empty() {
-        return Ok((keys, None));
+        return Ok((keys, dwords, None));
     }
 
     let pids = proc::find_pids();
     if pids.is_empty() {
-        return Ok((keys, Some("未检测到微信进程，请先登录微信".to_string())));
+        return Ok((
+            keys,
+            dwords,
+            Some("未检测到微信进程，请先登录微信".to_string()),
+        ));
     }
     let mut last_err = None;
     for pid in pids {
-        match extract_specs(pid) {
-            Ok(specs) => {
-                if specs.is_empty() {
+        match extract(pid) {
+            Ok(ex) => {
+                for d in ex.cfg_dwords {
+                    if !dwords.contains(&d) {
+                        dwords.push(d);
+                    }
+                }
+                if ex.specs.is_empty() {
                     continue;
                 }
-                let matched = match_keys(&specs, dbs);
+                let matched = match_keys(&ex.specs, dbs);
                 keys.extend(matched);
                 if dbs.iter().all(|d| keys.contains_key(&d.rel)) {
                     break;
@@ -264,10 +303,10 @@ pub fn load_or_extract(
             Err(e) => last_err = Some(e.to_string()),
         }
     }
-    if !keys.is_empty() {
-        save_cache(cache_path, &keys);
+    if !keys.is_empty() || !dwords.is_empty() {
+        save_cache(cache_path, &keys, &dwords);
     }
-    Ok((keys, last_err))
+    Ok((keys, dwords, last_err))
 }
 
 /// 用显式十六进制密钥（32 字节）验真单个库。

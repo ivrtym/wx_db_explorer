@@ -7,10 +7,12 @@ use anyhow::{anyhow, Result};
 use md5::{Digest, Md5};
 use rusqlite::{types::ValueRef, Connection};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct Ctx {
     pub account: String,
+    pub account_dir: PathBuf,
+    pub cfg_dwords: Vec<u32>,
     pub wxid: String,
     pub dbs: Vec<DbFile>,
     pub keys: HashMap<String, [u8; 32]>,
