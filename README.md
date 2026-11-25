@@ -3,8 +3,8 @@
 微信 4.x **本地数据库读取器**的 Rust 实现——`wechatauto` 读库部分的独立重写。
 只读、不注入、不改微信进程；不需要界面，不需要登录窗口。
 
-> 当前状态：**M3.5 完成**——密钥 → 解密 → WAL 合并 → 会话/消息/联系人/群/成员/标签
-> → 图片/语音/视频/文件导出。朋友圈、监听与采集引擎见路线图。
+> 当前状态：**M4 完成**——密钥 → 解密 → WAL 合并 → 会话/消息/联系人/群/成员/标签
+> → 图片/语音/视频/文件 → 朋友圈时间线与互动。监听与采集引擎见路线图。
 
 ---
 
@@ -27,6 +27,8 @@
 | 语音 | `media_*.db` 的 `VoiceInfo.voice_data` → `.silk`（SILK 头校验） |
 | 视频 | `packed_info` 里的 id → `msg/video/<id>.mp4`（**需先在微信里播放过一次**；否则明确报缺失） |
 | 文件 | 按 XML 原名 + 长度在 `msg/file` 下匹配（含 `(n)` 副本） |
+| 朋友圈 | `sns.db` 时间线解析（正文/图片/视频/点赞/评论）+ 本地缓存媒体定位 |
+| 互动通知 | `SnsMessage_tmp3`（他人对我的赞/评论，含未读数） |
 | 导出 | JSON |
 
 **跳过** `*_fts.db`：WCDB 自定义分词器 `MMFtsTokenizer`，系统 SQLite 打不开，
@@ -36,8 +38,8 @@
 
 | 阶段 | 内容 |
 |---|---|
-| M4 | 朋友圈（`sns.db` 时间线 + 互动通知 + 缓存媒体） |
 | M5 | Collector / Tailer（按 `docs/READ_API_V2.md` 的游标与检查点设计） |
+| M6 | 朋友圈远端媒体拉取（当前只读本地 `Sns` 缓存） |
 
 ## 用法
 
@@ -59,6 +61,10 @@ $B images 52764254929@chatroom --limit 20 --out ./imgs
 $B decrypt-dat ~/文档/xwechat_files/.../Img/xxx_t.dat --out one.jpg
 $B media wxid_xxx --limit 20 --out ./media            # 语音/视频/文件
 $B media wxid_xxx --kind voice --out ./voice
+$B moments --limit 20                 # 朋友圈时间线
+$B moments --me --json                # 只看自己（JSON）
+$B interactions --unread              # 未读赞/评论
+$B moment-media -3384355768585342428 --out ./sns   # 本地缓存的图片/视频
 ```
 
 全局参数：`--db-dir <xwechat_files>`、`--account <目录名>`、`--keys-file <path>`、`--json`。
@@ -101,6 +107,8 @@ src/
 | 语音导出 | 有 | 有（2928B SILK，sha256 一致） |
 | 视频导出 | 有（未播放时返回 None） | 有（播放后 494KB HEVC/AAC，sha256 一致） |
 | 文件导出 | 有 | 有（按原名+长度，32B 文本） |
+| 朋友圈 | 13 条 | 13 条，8 个字段逐条一致（含图片 md5） |
+| 互动通知 | 2 条 | 2 条一致 |
 
 ## 图片密钥是怎么拿到的
 

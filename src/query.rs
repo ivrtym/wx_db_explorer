@@ -119,6 +119,11 @@ impl Ctx {
         crate::store::open_ro(&path)
     }
 
+    /// 供其它模块按 rel 打开库（内部已处理密钥/解密缓存）。
+    pub fn open_public(&self, rel: &str) -> Result<Connection> {
+        self.open(rel)
+    }
+
     pub fn available(&self) -> usize {
         self.dbs
             .iter()

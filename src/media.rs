@@ -136,6 +136,14 @@ pub fn trim_footer(mut v: Vec<u8>) -> Vec<u8> {
     v
 }
 
+/// 缓存容器（朋友圈 Sns）可能是图片也可能是 mp4。
+pub fn container_ext(bytes: &[u8]) -> &'static str {
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return "mp4";
+    }
+    image_ext(bytes)
+}
+
 pub fn image_ext(bytes: &[u8]) -> &'static str {
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         "jpg"

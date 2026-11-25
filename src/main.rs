@@ -9,6 +9,7 @@ mod crypto;
 mod keys;
 mod media;
 mod model;
+mod moment;
 mod paths;
 mod proc;
 mod query;
@@ -71,6 +72,32 @@ enum Cmd {
     Members { group: String },
     /// 标签列表
     Labels,
+    /// 朋友圈时间线
+    Moments {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        me: bool,
+        #[arg(long)]
+        keyword: Option<String>,
+    },
+    /// 朋友圈互动通知（他人对我的赞/评论）
+    Interactions {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        unread: bool,
+    },
+    /// 导出一条朋友圈的本地缓存媒体
+    MomentMedia {
+        #[arg(allow_hyphen_values = true)]
+        tid: i64,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// all | image | video
+        #[arg(long, default_value = "all")]
+        kind: String,
+    },
     /// 导出语音/视频/文件（按消息类型分发）
     Media {
         chat: String,
@@ -296,6 +323,113 @@ fn run() -> Result<()> {
                 }
                 println!("共 {} 个标签", rows.len());
             }
+        }
+        Cmd::Moments { limit, me, keyword } => {
+            let rows = moment::moments(&ctx, *limit, 0, *me, keyword.as_deref())?;
+            if cli.json {
+                print_json(&rows)?;
+            } else {
+                for m in &rows {
+                    println!(
+                        "[{}] {} {}  图{} 视{} 赞{} 评{}  {}",
+                        m.tid,
+                        fmt_ts(m.create_time),
+                        m.nickname,
+                        m.images.len(),
+                        m.videos.len(),
+                        m.likes.len(),
+                        m.comments.len(),
+                        trunc(&m.text, 50)
+                    );
+                    for c in &m.comments {
+                        println!("    评论 {}: {}", c.nickname, trunc(&c.content, 60));
+                    }
+                }
+                println!("共 {} 条朋友圈", rows.len());
+            }
+        }
+        Cmd::Interactions { limit, unread } => {
+            let rows = moment::interactions(&ctx, *limit, *unread)?;
+            if cli.json {
+                print_json(&rows)?;
+            } else {
+                for i in &rows {
+                    println!(
+                        "[{}] {} {} -> {} {} {}",
+                        i.local_id,
+                        fmt_ts(i.create_time),
+                        i.from_nickname,
+                        i.to_nickname,
+                        trunc(&i.content, 40),
+                        if i.unread { "(未读)" } else { "" }
+                    );
+                }
+                println!(
+                    "共 {} 条互动（未读 {}）",
+                    rows.len(),
+                    moment::unread_count(&ctx)?
+                );
+            }
+        }
+        Cmd::MomentMedia { tid, out, kind } => {
+            let Some(m) = moment::moment(&ctx, *tid)? else {
+                println!("没有 tid={tid} 的朋友圈");
+                return Ok(());
+            };
+            let out_dir = out.clone().unwrap_or_else(|| {
+                paths::cache_root()
+                    .join("media")
+                    .join(&ctx.account)
+                    .join("moments")
+            });
+            std::fs::create_dir_all(&out_dir)?;
+            let key = media::load_cached_key().and_then(|k| media::ascii_key(&k.aes_key));
+            let mut ok = 0usize;
+            let mut miss = 0usize;
+            let groups: [(&Vec<moment::MediaItem>, &str); 2] =
+                [(&m.images, "image"), (&m.videos, "video")];
+            for (items, k) in groups {
+                if kind != "all" && kind != k {
+                    continue;
+                }
+                for (idx, it) in items.iter().enumerate() {
+                    let Some(p) = moment::local_media_path(&ctx.account_dir, &it.md5, k) else {
+                        println!(
+                            "[miss] {} #{} md5={} 无本地缓存",
+                            k,
+                            idx,
+                            &it.md5[..it.md5.len().min(8)]
+                        );
+                        miss += 1;
+                        continue;
+                    };
+                    let data = std::fs::read(&p)?;
+                    let bytes = if data.starts_with(&[0x07, 0x08]) {
+                        match media::decrypt_dat(&data, key.as_ref(), None) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                println!("[fail] {} #{} 解密失败：{e}", k, idx);
+                                miss += 1;
+                                continue;
+                            }
+                        }
+                    } else {
+                        data
+                    };
+                    let ext = media::container_ext(&bytes);
+                    let dst = out_dir.join(format!("{}_{}_{}.{}", m.tid, k, idx, ext));
+                    std::fs::write(&dst, &bytes)?;
+                    println!(
+                        "[ok] {} #{} -> {}（{} 字节）",
+                        k,
+                        idx,
+                        dst.display(),
+                        bytes.len()
+                    );
+                    ok += 1;
+                }
+            }
+            println!("完成：导出 {ok}，未找到 {miss} -> {}", out_dir.display());
         }
         Cmd::Media {
             chat,
