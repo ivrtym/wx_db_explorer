@@ -1,4 +1,4 @@
-# wx_db_rs
+# wx_db_explorer
 
 微信 4.x **本地数据库读取器**的 Rust 实现——`wechatauto` 读库部分的独立重写。
 只读、不注入、不改微信进程；不需要界面，不需要登录窗口。
@@ -14,10 +14,10 @@
 |---|---|
 | 目录探测 | `~/.xwechat/config/*.ini` 的 `MyDocument:`，回退 `~/文档/xwechat_files` |
 | 密钥提取 | 扫 `/proc/<pid>/mem` 的 `com.Tencent.WCDB.Config.Cipher`，XOR 掩码还原 keyspec |
-| 密钥缓存 | `~/.local/share/wx_db_rs/keys.json`（0600），按 salt 匹配 + 页 1 HMAC 验真 |
+| 密钥缓存 | `~/.local/share/wx_db_explorer/keys.json`（0600），按 salt 匹配 + 页 1 HMAC 验真 |
 | 库解密 | SQLCipher4 页级 AES-256-CBC，页 1 明文头，`PRAGMA quick_check` 校验 |
 | **WAL 合并** | 按 salt 过滤帧、逐页解密覆盖、修正页 1 页数；失败退回主库快照 |
-| 解密缓存 | `~/.local/share/wx_db_rs/db/<account>/`，stamp 记录 mtime/size/wal/applied |
+| 解密缓存 | `~/.local/share/wx_db_explorer/db/<account>/`，stamp 记录 mtime/size/wal/applied |
 | 会话 | `SessionTable`（未读、摘要、最后时间、最后发送者） |
 | 消息 | 跨分片按 `Msg_<md5(chat)>` 查询，`Name2Id` 解析发送者，支持复合类型码 |
 | 联系人 | 昵称/备注/微信号模糊搜索（**无 50 条上限**） |
@@ -47,11 +47,24 @@
 | M9 | 打包发布：README 示例、Release 二进制、CI |
 | — | 远端媒体：已验证需会话态/签名，直连只能拿到占位图；不再投入 |
 
+## 安装 / 分发
+
+```bash
+tar -xzf wx_db_explorer-0.9.0-x86_64-unknown-linux-gnu.tar.gz
+./wx_db_explorer-0.9.0-x86_64-unknown-linux-gnu/wx_db_explorer doctor
+```
+
+- 单文件二进制（已 strip，约 5.8 MB）；SQLite 静态编入，**不依赖系统 libsqlite3**
+- 动态链接 glibc；需要完全静态版可
+  `cargo build --release --target x86_64-unknown-linux-musl`
+- 重新打包：`sh scripts/release.sh` → `dist/wx_db_explorer-<ver>-<target>.tar.gz`
+  （含 README 与 LICENSE，附 sha256）
+
 ## 用法
 
 ```bash
 cargo build --release
-B=./target/release/wx_db_rs
+B=./target/release/wx_db_explorer
 
 $B doctor                       # 账号 / 库数量 / 可用密钥 / 缺失项
 $B sessions --limit 20

@@ -205,11 +205,20 @@ impl Account {
     }
 }
 
-pub fn cache_root() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
+fn data_base() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| user_home().join(".local").join("share"));
-    base.join("wx_db_rs")
+        .unwrap_or_else(|| user_home().join(".local").join("share"))
+}
+
+/// 当前缓存根：`~/.local/share/wx_db_explorer`。
+pub fn cache_root() -> PathBuf {
+    data_base().join("wx_db_explorer")
+}
+
+/// 旧版缓存根（`wx_db_rs`），用于平滑迁移密钥/图片 key。
+pub fn legacy_cache_root() -> PathBuf {
+    data_base().join("wx_db_rs")
 }
 
 #[allow(dead_code)]

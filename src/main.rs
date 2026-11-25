@@ -1,4 +1,4 @@
-//! wx_db_rs —— 微信 4.x 本地数据库读取器（Rust）。
+//! wx_db_explorer —— 微信 4.x 本地数据库探索器。
 //!
 //! 覆盖：路径探测 → 密钥提取（/proc/<pid>/mem）→ SQLCipher4 解密（页级）
 //! → 会话 / 消息（跨分片）/ 联系人 / 群 / 成员 / 标签 / 导出。
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
-    name = "wx_db_rs",
+    name = "wx_db_explorer",
     version,
     about = "微信 4.x 本地数据库读取器（Rust）"
 )]
@@ -35,7 +35,7 @@ struct Cli {
     /// 账号目录名（默认取最新的）
     #[arg(long, global = true)]
     account: Option<String>,
-    /// 密钥缓存文件（默认 ~/.local/share/wx_db_rs/keys.json）
+    /// 密钥缓存文件（默认 ~/.local/share/wx_db_explorer/keys.json）
     #[arg(long, global = true)]
     keys_file: Option<PathBuf>,
     /// 输出 JSON
@@ -204,7 +204,7 @@ fn load_ctx(cli: &Cli) -> Result<Ctx> {
     let cache = cli.keys_file.clone().unwrap_or_else(keys::cache_file);
     let (keys, cfg_dwords, err) = keys::load_or_extract(&dbs, &cache)?;
     if let Some(e) = err {
-        eprintln!("[wx_db_rs] 密钥提示：{e}");
+        eprintln!("[wx_db_explorer] 密钥提示：{e}");
     }
     Ok(Ctx {
         account: acct.account.clone(),
@@ -914,7 +914,7 @@ fn run() -> Result<()> {
             let key = media::resolve_key(&ctx.cfg_dwords, &ctx.wxid, &probe);
             if key.is_none() {
                 println!("提示：没有可用的图片密钥，本次只列本机副本。");
-                println!("      先在微信里打开任意一张图片，再跑 `wx_db_rs image-key`。");
+                println!("      先在微信里打开任意一张图片，再跑 `wx_db_explorer image-key`。");
             }
             let aes = key.as_ref().and_then(|k| media::ascii_key(&k.aes_key));
             let rows = query::messages(&ctx, chat, 2000)?;

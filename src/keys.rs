@@ -206,8 +206,15 @@ pub fn cache_file() -> std::path::PathBuf {
 }
 
 fn load_cache(path: &Path) -> (HashMap<String, [u8; 32]>, Vec<u32>) {
+    // 兼容旧版缓存目录（首次以 wx_db_explorer 运行时不必重新扫内存）
+    let legacy = crate::paths::legacy_cache_root().join("keys.json");
+    let path = if path.exists() {
+        path.to_path_buf()
+    } else {
+        legacy
+    };
     let mut out = HashMap::new();
-    let Ok(text) = fs::read_to_string(path) else {
+    let Ok(text) = fs::read_to_string(&path) else {
         return (out, Vec::new());
     };
     let Ok(cache) = serde_json::from_str::<KeyCache>(&text) else {

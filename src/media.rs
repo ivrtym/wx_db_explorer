@@ -261,6 +261,7 @@ pub fn key_cache_file() -> PathBuf {
 pub fn load_cached_key() -> Option<ImageKey> {
     for p in [
         key_cache_file(),
+        crate::paths::legacy_cache_root().join("image_key.json"),
         crate::paths::user_home().join(".local/share/wechatauto/image_key.json"),
     ] {
         let Ok(text) = fs::read_to_string(&p) else {

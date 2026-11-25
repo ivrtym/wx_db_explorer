@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Cursor {
@@ -611,12 +611,6 @@ pub struct DimDiff {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub changed: Vec<String>,
-}
-
-impl DimDiff {
-    pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
-    }
 }
 
 pub fn dimension_diff(
