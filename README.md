@@ -3,8 +3,8 @@
 微信 4.x **本地数据库读取器**的 Rust 实现——`wechatauto` 读库部分的独立重写。
 只读、不注入、不改微信进程；不需要界面，不需要登录窗口。
 
-> 当前状态：**M4 完成**——密钥 → 解密 → WAL 合并 → 会话/消息/联系人/群/成员/标签
-> → 图片/语音/视频/文件 → 朋友圈时间线与互动。监听与采集引擎见路线图。
+> 当前状态：**M5 完成**——读 + 媒体 + 朋友圈 + **增量采集 / 准实时监听**。
+> 后续只剩工程化增强（见路线图）。
 
 ---
 
@@ -30,6 +30,8 @@
 | 朋友圈 | `sns.db` 时间线解析（正文/图片/视频/点赞/评论） |
 | 朋友圈媒体 | Sns 缓存文件名是不透明 key，按**宽高精确匹配 + 明文尺寸消歧**（歧义拒绝），解密后导出 |
 | 互动通知 | `SnsMessage_tmp3`（他人对我的赞/评论，含未读数） |
+| 采集 Collector | `collect messages` 增量续采（游标 + 检查点）、维度快照；JSONL / SQLite sink |
+| 监听 Tailer | `tail --chat/--all`，JSONL 事件、检查点续传、缺口启发式 |
 | 导出 | JSON |
 
 **跳过** `*_fts.db`：WCDB 自定义分词器 `MMFtsTokenizer`，系统 SQLite 打不开，
@@ -39,8 +41,8 @@
 
 | 阶段 | 内容 |
 |---|---|
-| M5 | Collector / Tailer（按 `docs/READ_API_V2.md` 的游标与检查点设计） |
-| M6 | 朋友圈远端媒体拉取（当前只读本地 `Sns` 缓存） |
+| M6 | 朋友圈/互动的增量游标（当前一次性导出）；远端媒体拉取 |
+| M7 | 维度 diff（联系人/群/成员的快照哈希变更检测） |
 
 ## 用法
 
@@ -66,7 +68,21 @@ $B moments --limit 20                 # 朋友圈时间线
 $B moments --me --json                # 只看自己（JSON）
 $B interactions --unread              # 未读赞/评论
 $B moment-media -3384355768585342428 --out ./sns   # 按宽高匹配本地缓存并解密
+
+# 增量采集（断点续采；--full 从头重采）
+$B collect messages --all --out msgs.jsonl --state state.json
+$B collect messages --chat 52764254929@chatroom --since 1795500000 --out one.jsonl
+$B collect contacts --out contacts.jsonl
+$B collect messages --all --out msgs.db        # 按后缀选 SQLite sink（幂等 upsert）
+
+# 准实时监听（JSONL 事件；Ctrl+C 退出，检查点每轮落盘）
+$B tail --chat 52764254929@chatroom --state tail.json
+$B tail --all --interval 2 --state tail.json
+$B tail --all --once --limit 5                 # 只轮询一次（调试/回放）
 ```
+
+**投递语义**：at-least-once；同一会话内按 `sort_seq` 严格升序；跨会话不保证全局序。
+检查点记录 `(chat, sort_seq, shard, local_id)` 与解密快照 `epoch`，崩溃后从上次位置继续。
 
 > 朋友圈图片缓存的文件名与 feed 的 md5 **没有代数关系**，只能按
 > `<size width height>` 精确匹配；同尺寸多张时用明文字节数消歧，

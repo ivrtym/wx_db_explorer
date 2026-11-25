@@ -6,7 +6,7 @@ use crate::store::Store;
 use anyhow::{anyhow, Result};
 use md5::{Digest, Md5};
 use rusqlite::{types::ValueRef, Connection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub struct Ctx {
@@ -153,12 +153,11 @@ pub fn sessions(ctx: &Ctx, limit: usize) -> Result<Vec<Session>> {
     Ok(out)
 }
 
-/// 跨分片读消息：表名 = `Msg_<md5(username)>`。
+/// 跨分片读消息：表名 = `Msg_<md5(username)>`（最近 N 条，降序）。
 pub fn messages(ctx: &Ctx, chat: &str, limit: usize) -> Result<Vec<Message>> {
     let table = format!("Msg_{:x}", Md5::digest(chat.as_bytes()));
     let mut out: Vec<Message> = Vec::new();
     for db in &ctx.dbs {
-        // 只看普通消息分片，排除 biz_message_*（公众号）
         let base = db.rel.rsplit('/').next().unwrap_or("");
         if !db.rel.starts_with("message/") || !base.starts_with("message_") {
             continue;
@@ -171,39 +170,137 @@ pub fn messages(ctx: &Ctx, chat: &str, limit: usize) -> Result<Vec<Message>> {
         }
         let senders = name2id_map(&conn).unwrap_or_default();
         let sql = format!(
-            "SELECT local_id, local_type, sort_seq, real_sender_id, create_time, \
+            "SELECT local_id, server_id, local_type, sort_seq, real_sender_id, create_time, \
              message_content FROM \"{table}\" ORDER BY sort_seq DESC LIMIT ?1"
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query([limit as i64])?;
         while let Some(r) = rows.next()? {
-            let type_code: i64 = r.get(1)?;
-            let kind = type_name(type_code);
-            let sender_id: i64 = r.get::<_, Option<i64>>(3)?.unwrap_or(0);
-            let sender = senders.get(&sender_id).cloned().unwrap_or_default();
-            let mut content = friendly_content(r.get_ref(5)?, &kind);
-            // 群消息正文带「发送者:\n」前缀，显示时去掉
-            if !sender.is_empty() {
-                if let Some(rest) = content.strip_prefix(&format!("{sender}:\n")) {
-                    content = rest.trim_start().to_string();
-                } else if let Some(rest) = content.strip_prefix(&format!("{sender}:")) {
-                    content = rest.trim_start().to_string();
-                }
-            }
-            out.push(Message {
-                local_id: r.get(0)?,
-                kind,
-                type_code,
-                sender_id,
-                sender,
-                create_time: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                sort_seq: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                content,
-                shard: db.rel.clone(),
-            });
+            out.push(build_message(&r, &senders, chat, &db.rel)?);
         }
     }
     out.sort_by(|a, b| b.sort_seq.cmp(&a.sort_seq));
+    out.truncate(limit);
+    Ok(out)
+}
+
+fn build_message(
+    r: &rusqlite::Row<'_>,
+    senders: &HashMap<i64, String>,
+    chat: &str,
+    shard: &str,
+) -> Result<Message> {
+    let type_code: i64 = r.get(2)?;
+    let kind = type_name(type_code);
+    let sender_id: i64 = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
+    let sender = senders.get(&sender_id).cloned().unwrap_or_default();
+    let mut content = friendly_content(r.get_ref(6)?, &kind);
+    if !sender.is_empty() {
+        if let Some(rest) = content.strip_prefix(&format!("{sender}:\n")) {
+            content = rest.trim_start().to_string();
+        } else if let Some(rest) = content.strip_prefix(&format!("{sender}:")) {
+            content = rest.trim_start().to_string();
+        }
+    }
+    Ok(Message {
+        chat: chat.to_string(),
+        server_id: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+        local_id: r.get(0)?,
+        kind,
+        type_code,
+        sender_id,
+        sender,
+        create_time: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+        sort_seq: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+        content,
+        shard: shard.to_string(),
+    })
+}
+
+/// 某会话在哪些分片里有消息表（每分片只查一次 sqlite_master）。
+pub fn shard_index(ctx: &Ctx, chats: &[String]) -> HashMap<String, Vec<String>> {
+    let mut want: HashMap<String, String> = HashMap::new();
+    for c in chats {
+        want.insert(format!("{:x}", Md5::digest(c.as_bytes())), c.clone());
+    }
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for db in &ctx.dbs {
+        let base = db.rel.rsplit('/').next().unwrap_or("");
+        if !db.rel.starts_with("message/") || !base.starts_with("message_") {
+            continue;
+        }
+        let Ok(conn) = ctx.open(&db.rel) else {
+            continue;
+        };
+        let Ok(mut stmt) =
+            conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
+        else {
+            continue;
+        };
+        let Ok(mut rows) = stmt.query([]) else {
+            continue;
+        };
+        while let Ok(Some(r)) = rows.next() {
+            let Ok(name) = r.get::<_, String>(0) else {
+                continue;
+            };
+            if let Some(hex) = name.strip_prefix("Msg_") {
+                if let Some(chat) = want.get(hex) {
+                    out.entry(chat.clone()).or_default().push(db.rel.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 增量读：`sort_seq > after`，按 `sort_seq` 升序；可按类型/时间过滤。
+#[allow(clippy::too_many_arguments)]
+pub fn messages_after(
+    ctx: &Ctx,
+    chat: &str,
+    shards: &[String],
+    after_seq: i64,
+    limit: usize,
+    kinds: Option<&HashSet<String>>,
+    since: Option<i64>,
+    until: Option<i64>,
+) -> Result<Vec<Message>> {
+    let table = format!("Msg_{:x}", Md5::digest(chat.as_bytes()));
+    let mut out: Vec<Message> = Vec::new();
+    for rel in shards {
+        let Ok(conn) = ctx.open(rel) else { continue };
+        if !table_exists(&conn, &table)? {
+            continue;
+        }
+        let senders = name2id_map(&conn).unwrap_or_default();
+        let sql = format!(
+            "SELECT local_id, server_id, local_type, sort_seq, real_sender_id, create_time, \
+             message_content FROM \"{table}\" WHERE sort_seq > ?1 ORDER BY sort_seq ASC LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params![after_seq, limit as i64])?;
+        while let Some(r) = rows.next()? {
+            let m = build_message(&r, &senders, chat, rel)?;
+            if let Some(k) = kinds {
+                if !k.contains(&m.kind) {
+                    continue;
+                }
+            }
+            if let Some(s) = since {
+                if m.create_time < s {
+                    continue;
+                }
+            }
+            if let Some(u) = until {
+                if m.create_time > u {
+                    continue;
+                }
+            }
+            out.push(m);
+        }
+    }
+    out.sort_by(|a, b| a.sort_seq.cmp(&b.sort_seq));
     out.truncate(limit);
     Ok(out)
 }

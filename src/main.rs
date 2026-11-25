@@ -14,6 +14,7 @@ mod paths;
 mod proc;
 mod query;
 mod store;
+mod sync;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
@@ -72,6 +73,47 @@ enum Cmd {
     Members { group: String },
     /// 标签列表
     Labels,
+    /// 增量采集（断点续采）：messages / moments / interactions / contacts / groups / members / labels / sessions
+    Collect {
+        dataset: String,
+        #[arg(long)]
+        chat: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        since: Option<i64>,
+        #[arg(long)]
+        until: Option<i64>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        state: Option<PathBuf>,
+        #[arg(long, default_value_t = 500)]
+        batch: usize,
+        /// 忽略已有游标，从头采
+        #[arg(long)]
+        full: bool,
+        /// 逗号分隔的消息类型（如 文本,图片）
+        #[arg(long)]
+        kinds: Option<String>,
+    },
+    /// 准实时监听新消息（JSONL 事件），`--once` 只轮询一次
+    Tail {
+        #[arg(long)]
+        chat: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        state: Option<PathBuf>,
+        #[arg(long, default_value_t = 1.0)]
+        interval: f64,
+        #[arg(long)]
+        once: bool,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        #[arg(long)]
+        kinds: Option<String>,
+    },
     /// 朋友圈时间线
     Moments {
         #[arg(long, default_value_t = 20)]
@@ -323,6 +365,156 @@ fn run() -> Result<()> {
                 }
                 println!("共 {} 个标签", rows.len());
             }
+        }
+        Cmd::Collect {
+            dataset,
+            chat,
+            all,
+            since,
+            until,
+            out,
+            state,
+            batch,
+            full,
+            kinds,
+        } => {
+            if !*all && chat.is_none() && dataset == "messages" {
+                return Err(anyhow!("messages 采集请给 --chat 或 --all"));
+            }
+            let out_path = out.clone().unwrap_or_else(|| {
+                paths::cache_root()
+                    .join("export")
+                    .join(&ctx.account)
+                    .join(format!("{dataset}.jsonl"))
+            });
+            let state_path = state.clone().unwrap_or_else(|| {
+                paths::cache_root()
+                    .join("state")
+                    .join(&ctx.account)
+                    .join(format!("{dataset}.json"))
+            });
+            if dataset == "messages" && *full {
+                // --full：从零重采，清掉旧导出与游标
+                let _ = std::fs::remove_file(&out_path);
+                let _ = std::fs::remove_file(&state_path);
+            }
+            let mut sink: Box<dyn sync::Sink> = if out_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "db" || e == "sqlite")
+                .unwrap_or(false)
+            {
+                Box::new(sync::SqliteSink::create(&out_path)?)
+            } else {
+                Box::new(sync::JsonlSink::create(&out_path)?)
+            };
+            let kind_set = kinds.as_ref().map(|k| {
+                k.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<std::collections::HashSet<_>>()
+            });
+            let n = match dataset.as_str() {
+                "messages" => {
+                    let chats = if *all {
+                        None
+                    } else {
+                        Some(vec![chat.clone().unwrap_or_default()])
+                    };
+                    let opts = sync::CollectOpts {
+                        chats,
+                        kinds: kind_set,
+                        since: *since,
+                        until: *until,
+                        batch: *batch,
+                        full: *full,
+                    };
+                    let rep = sync::collect_messages(&ctx, sink.as_mut(), &state_path, &opts)?;
+                    println!(
+                        "messages: {} 条 / {} 个会话，epoch={} -> {}（state {}）",
+                        rep.rows,
+                        rep.chats,
+                        rep.epoch,
+                        out_path.display(),
+                        state_path.display()
+                    );
+                    rep.rows
+                }
+                "moments" => {
+                    let mut n = 0usize;
+                    for m in moment::moments(&ctx, 5000, 0, false, None)? {
+                        sink.write("moments", &m.id, &serde_json::to_value(&m)?)?;
+                        n += 1;
+                    }
+                    sink.flush()?;
+                    n
+                }
+                "interactions" => {
+                    let mut n = 0usize;
+                    for i in moment::interactions(&ctx, 5000, false)? {
+                        sink.write(
+                            "interactions",
+                            &i.local_id.to_string(),
+                            &serde_json::to_value(&i)?,
+                        )?;
+                        n += 1;
+                    }
+                    sink.flush()?;
+                    n
+                }
+                other => sync::collect_dimension(&ctx, other, sink.as_mut())?,
+            };
+            if dataset.as_str() != "messages" {
+                println!(
+                    "{}: {} 条 -> {}（state {}）",
+                    dataset,
+                    n,
+                    out_path.display(),
+                    state_path.display()
+                );
+            }
+        }
+        Cmd::Tail {
+            chat,
+            all,
+            state,
+            interval,
+            once,
+            limit,
+            kinds,
+        } => {
+            if !*all && chat.is_none() {
+                return Err(anyhow!("tail 请给 --chat 或 --all"));
+            }
+            let state_path = state.clone().unwrap_or_else(|| {
+                paths::cache_root()
+                    .join("state")
+                    .join(&ctx.account)
+                    .join("tail.json")
+            });
+            let kind_set = kinds.as_ref().map(|k| {
+                k.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<std::collections::HashSet<_>>()
+            });
+            let opts = sync::TailOpts {
+                chats: if *all {
+                    None
+                } else {
+                    Some(vec![chat.clone().unwrap_or_default()])
+                },
+                kinds: kind_set,
+                interval: *interval,
+                once: *once,
+                limit: *limit,
+            };
+            let mut out = std::io::stdout();
+            sync::tail(&ctx, &state_path, &opts, |ev| {
+                writeln!(out, "{}", serde_json::to_string(ev)?)?;
+                out.flush()?;
+                Ok(())
+            })?;
         }
         Cmd::Moments { limit, me, keyword } => {
             let rows = moment::moments(&ctx, *limit, 0, *me, keyword.as_deref())?;

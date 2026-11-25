@@ -13,6 +13,8 @@ pub struct Session {
 
 #[derive(Serialize, Debug, Clone)]
 pub struct Message {
+    pub chat: String,
+    pub server_id: i64,
     pub local_id: i64,
     pub kind: String,
     pub type_code: i64,
