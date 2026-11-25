@@ -27,7 +27,8 @@
 | 语音 | `media_*.db` 的 `VoiceInfo.voice_data` → `.silk`（SILK 头校验） |
 | 视频 | `packed_info` 里的 id → `msg/video/<id>.mp4`（**需先在微信里播放过一次**；否则明确报缺失） |
 | 文件 | 按 XML 原名 + 长度在 `msg/file` 下匹配（含 `(n)` 副本） |
-| 朋友圈 | `sns.db` 时间线解析（正文/图片/视频/点赞/评论）+ 本地缓存媒体定位 |
+| 朋友圈 | `sns.db` 时间线解析（正文/图片/视频/点赞/评论） |
+| 朋友圈媒体 | Sns 缓存文件名是不透明 key，按**宽高精确匹配 + 明文尺寸消歧**（歧义拒绝），解密后导出 |
 | 互动通知 | `SnsMessage_tmp3`（他人对我的赞/评论，含未读数） |
 | 导出 | JSON |
 
@@ -64,8 +65,12 @@ $B media wxid_xxx --kind voice --out ./voice
 $B moments --limit 20                 # 朋友圈时间线
 $B moments --me --json                # 只看自己（JSON）
 $B interactions --unread              # 未读赞/评论
-$B moment-media -3384355768585342428 --out ./sns   # 本地缓存的图片/视频
+$B moment-media -3384355768585342428 --out ./sns   # 按宽高匹配本地缓存并解密
 ```
+
+> 朋友圈图片缓存的文件名与 feed 的 md5 **没有代数关系**，只能按
+> `<size width height>` 精确匹配；同尺寸多张时用明文字节数消歧，
+> 仍歧义则拒绝（不拿无关图冒充）。
 
 全局参数：`--db-dir <xwechat_files>`、`--account <目录名>`、`--keys-file <path>`、`--json`。
 
@@ -108,6 +113,7 @@ src/
 | 视频导出 | 有（未播放时返回 None） | 有（播放后 494KB HEVC/AAC，sha256 一致） |
 | 文件导出 | 有 | 有（按原名+长度，32B 文本） |
 | 朋友圈 | 13 条 | 13 条，8 个字段逐条一致（含图片 md5） |
+| 朋友圈图片 | 需显式传 key 才能解 | 5 条动态的图片导出成功；与 Python 选中的缓存文件 **sha256 相同** |
 | 互动通知 | 2 条 | 2 条一致 |
 
 ## 图片密钥是怎么拿到的

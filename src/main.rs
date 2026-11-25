@@ -383,50 +383,75 @@ fn run() -> Result<()> {
                     .join("moments")
             });
             std::fs::create_dir_all(&out_dir)?;
-            let key = media::load_cached_key().and_then(|k| media::ascii_key(&k.aes_key));
+            let key = media::load_cached_key();
+            let aes = key.as_ref().and_then(|k| media::ascii_key(&k.aes_key));
+            let xor = key.as_ref().and_then(|k| k.xor_key);
+            let index = moment::scan_cached_images(&ctx.account_dir, aes.as_ref(), xor);
+            println!("Sns 缓存里可识别的图片：{} 张", index.len());
             let mut ok = 0usize;
             let mut miss = 0usize;
-            let groups: [(&Vec<moment::MediaItem>, &str); 2] =
-                [(&m.images, "image"), (&m.videos, "video")];
-            for (items, k) in groups {
-                if kind != "all" && kind != k {
-                    continue;
-                }
-                for (idx, it) in items.iter().enumerate() {
-                    let Some(p) = moment::local_media_path(&ctx.account_dir, &it.md5, k) else {
-                        println!(
-                            "[miss] {} #{} md5={} 无本地缓存",
-                            k,
-                            idx,
-                            &it.md5[..it.md5.len().min(8)]
-                        );
-                        miss += 1;
-                        continue;
-                    };
-                    let data = std::fs::read(&p)?;
-                    let bytes = if data.starts_with(&[0x07, 0x08]) {
-                        match media::decrypt_dat(&data, key.as_ref(), None) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                println!("[fail] {} #{} 解密失败：{e}", k, idx);
-                                miss += 1;
-                                continue;
-                            }
+            if kind == "all" || kind == "image" {
+                for (idx, it) in m.images.iter().enumerate() {
+                    match moment::match_cached_image(&index, it.width, it.height, it.size) {
+                        Some(c) => {
+                            let ext = media::container_ext(&c.bytes);
+                            let dst =
+                                out_dir.join(format!("{}_{}_{}.{}", m.tid, "image", idx, ext));
+                            std::fs::write(&dst, &c.bytes)?;
+                            println!(
+                                "[ok] image #{} {}x{} -> {}（{} 字节）",
+                                idx,
+                                c.w,
+                                c.h,
+                                dst.display(),
+                                c.bytes.len()
+                            );
+                            ok += 1;
                         }
-                    } else {
-                        data
-                    };
-                    let ext = media::container_ext(&bytes);
-                    let dst = out_dir.join(format!("{}_{}_{}.{}", m.tid, k, idx, ext));
-                    std::fs::write(&dst, &bytes)?;
-                    println!(
-                        "[ok] {} #{} -> {}（{} 字节）",
-                        k,
-                        idx,
-                        dst.display(),
-                        bytes.len()
-                    );
-                    ok += 1;
+                        None => {
+                            println!(
+                                "[miss] image #{} 期望 {}x{} / {}B，缓存里无匹配（或存在歧义）",
+                                idx, it.width, it.height, it.size
+                            );
+                            miss += 1;
+                        }
+                    }
+                }
+            }
+            if kind == "all" || kind == "video" {
+                for (idx, it) in m.videos.iter().enumerate() {
+                    match moment::match_cached_video(&ctx.account_dir, it.size) {
+                        Some(p) => {
+                            let data = std::fs::read(&p)?;
+                            let bytes = if data.starts_with(&[0x07, 0x08]) {
+                                match media::decrypt_dat(&data, aes.as_ref(), xor) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        println!("[fail] video #{} 解密失败：{e}", idx);
+                                        miss += 1;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                data
+                            };
+                            let ext = media::container_ext(&bytes);
+                            let dst =
+                                out_dir.join(format!("{}_{}_{}.{}", m.tid, "video", idx, ext));
+                            std::fs::write(&dst, &bytes)?;
+                            println!(
+                                "[ok] video #{} -> {}（{} 字节）",
+                                idx,
+                                dst.display(),
+                                bytes.len()
+                            );
+                            ok += 1;
+                        }
+                        None => {
+                            println!("[miss] video #{} 期望 {}B，缓存里无匹配", idx, it.size);
+                            miss += 1;
+                        }
+                    }
                 }
             }
             println!("完成：导出 {ok}，未找到 {miss} -> {}", out_dir.display());

@@ -364,31 +364,6 @@ pub fn unread_count(ctx: &Ctx) -> Result<i64> {
     )?)
 }
 
-/// 本地缓存路径：`cache/<YYYY-MM>/Sns/{Img,Video}/<md5前2>/<md5后30>`。
-pub fn local_media_path(
-    account_dir: &std::path::Path,
-    md5: &str,
-    kind: &str,
-) -> Option<std::path::PathBuf> {
-    if md5.len() != 32 {
-        return None;
-    }
-    let sub = if kind == "video" { "Video" } else { "Img" };
-    let base = account_dir.join("cache");
-    let bucket = &md5[..2];
-    let leaf = &md5[2..];
-    let Ok(rd) = std::fs::read_dir(&base) else {
-        return None;
-    };
-    for e in rd.flatten() {
-        let p = e.path().join("Sns").join(sub).join(bucket).join(leaf);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +403,214 @@ mod tests {
 <videomd5>bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</videomd5></media>"#;
         let m = parse_feed(xml);
         assert_eq!(m.videos.len(), 1, "{:?}", m.images);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sns 缓存匹配（文件名是不透明 key，只能按内容特征匹配）
+// ---------------------------------------------------------------------------
+
+/// 从图片字节里读宽高（JPEG SOF / PNG IHDR / GIF）。
+pub fn image_dims(b: &[u8]) -> Option<(u32, u32)> {
+    if b.starts_with(&[0xFF, 0xD8]) {
+        let mut i = 2usize;
+        while i + 9 < b.len() {
+            if b[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = b[i + 1];
+            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+                i += 2;
+                continue;
+            }
+            if i + 4 > b.len() {
+                return None;
+            }
+            let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+            if matches!(
+                marker,
+                0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
+            ) {
+                if i + 9 > b.len() {
+                    return None;
+                }
+                let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
+                let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
+                return Some((w, h));
+            }
+            i += 2 + len.max(2);
+        }
+        None
+    } else if b.starts_with(b"\x89PNG") && b.len() > 24 {
+        let w = u32::from_be_bytes(b[16..20].try_into().ok()?);
+        let h = u32::from_be_bytes(b[20..24].try_into().ok()?);
+        Some((w, h))
+    } else if b.starts_with(b"GIF8") && b.len() > 10 {
+        let w = u16::from_le_bytes([b[6], b[7]]) as u32;
+        let h = u16::from_le_bytes([b[8], b[9]]) as u32;
+        Some((w, h))
+    } else {
+        None
+    }
+}
+
+pub struct CachedImage {
+    #[allow(dead_code)]
+    pub path: std::path::PathBuf,
+    pub w: u32,
+    pub h: u32,
+    pub plain_size: usize,
+    pub bytes: Vec<u8>,
+}
+
+fn sns_files(account_dir: &std::path::Path, sub: &str) -> Vec<std::path::PathBuf> {
+    let base = account_dir.join("cache");
+    let mut out = Vec::new();
+    let Ok(months) = std::fs::read_dir(&base) else {
+        return out;
+    };
+    for mon in months.flatten() {
+        let Ok(buckets) = std::fs::read_dir(mon.path().join("Sns").join(sub)) else {
+            continue;
+        };
+        for b in buckets.flatten() {
+            let Ok(files) = std::fs::read_dir(b.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                if f.path().is_file() {
+                    out.push(f.path());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 扫描并解密 Sns 图片缓存，得到 (宽, 高, 明文字节数)。
+pub fn scan_cached_images(
+    account_dir: &std::path::Path,
+    aes: Option<&[u8; 16]>,
+    xor: Option<u8>,
+) -> Vec<CachedImage> {
+    let mut out = Vec::new();
+    for p in sns_files(account_dir, "Img") {
+        let Ok(data) = std::fs::read(&p) else {
+            continue;
+        };
+        let plain = if data.starts_with(&[0x07, 0x08]) {
+            match crate::media::decrypt_dat(&data, aes, xor) {
+                Ok(b) => b,
+                Err(_) => continue,
+            }
+        } else {
+            data
+        };
+        if let Some((w, h)) = image_dims(&plain) {
+            out.push(CachedImage {
+                path: p,
+                w,
+                h,
+                plain_size: plain.len(),
+                bytes: plain,
+            });
+        }
+    }
+    out
+}
+
+/// 按宽高精确匹配；同尺寸多张时用明文尺寸偏差消歧（≤512B 或 10%），歧义则拒绝。
+pub fn match_cached_image<'a>(
+    index: &'a [CachedImage],
+    w: u32,
+    h: u32,
+    size: u64,
+) -> Option<&'a CachedImage> {
+    let mut hits: Vec<&CachedImage> = index.iter().filter(|c| c.w == w && c.h == h).collect();
+    if hits.is_empty() {
+        return None;
+    }
+    if hits.len() == 1 {
+        return hits.pop();
+    }
+    let tol = std::cmp::max(512i64, (size as i64) / 10);
+    let mut scored: Vec<(i64, &CachedImage)> = hits
+        .into_iter()
+        .map(|c| ((c.plain_size as i64 - size as i64).abs(), c))
+        .filter(|(d, _)| *d <= tol)
+        .collect();
+    scored.sort_by_key(|(d, _)| *d);
+    match scored.len() {
+        1 => Some(scored[0].1),
+        n if n > 1 && scored[0].0 < scored[1].0 => Some(scored[0].1),
+        _ => None,
+    }
+}
+
+/// 视频缓存按字节数匹配：明文（fsz==size）或 V2 容器（fsz==size+31），容差 8。
+pub fn match_cached_video(account_dir: &std::path::Path, size: u64) -> Option<std::path::PathBuf> {
+    if size == 0 {
+        return None;
+    }
+    let mut plain: Option<(i64, std::path::PathBuf)> = None;
+    let mut container: Option<(i64, std::path::PathBuf)> = None;
+    for p in sns_files(account_dir, "Video") {
+        let Ok(fsz) = std::fs::metadata(&p).map(|m| m.len()) else {
+            continue;
+        };
+        let d_plain = (fsz as i64 - size as i64).abs();
+        let d_cont = (fsz as i64 - size as i64 - 31).abs();
+        if d_plain <= 8 && plain.as_ref().map(|(d, _)| d_plain < *d).unwrap_or(true) {
+            plain = Some((d_plain, p.clone()));
+        }
+        if d_cont <= 8 && container.as_ref().map(|(d, _)| d_cont < *d).unwrap_or(true) {
+            container = Some((d_cont, p));
+        }
+    }
+    plain.or(container).map(|(_, p)| p)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn dims_from_png_header() {
+        let mut png = vec![0u8; 33];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[16..20].copy_from_slice(&1080u32.to_be_bytes());
+        png[20..24].copy_from_slice(&1684u32.to_be_bytes());
+        assert_eq!(image_dims(&png), Some((1080, 1684)));
+    }
+
+    #[test]
+    fn dims_from_jpeg_sof0() {
+        let mut j = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
+        j.extend_from_slice(&(667u16).to_be_bytes()); // height
+        j.extend_from_slice(&(375u16).to_be_bytes()); // width
+        j.extend_from_slice(&[0u8; 16]);
+        assert_eq!(image_dims(&j), Some((375, 667)));
+    }
+
+    #[test]
+    fn size_disambiguation() {
+        let mk = |w, h, size| CachedImage {
+            path: std::path::PathBuf::from("x"),
+            w,
+            h,
+            plain_size: size,
+            bytes: Vec::new(),
+        };
+        let idx = vec![mk(100, 200, 1000), mk(100, 200, 5000), mk(1, 1, 1000)];
+        assert_eq!(
+            match_cached_image(&idx, 100, 200, 1020).map(|c| c.plain_size),
+            Some(1000)
+        );
+        assert!(
+            match_cached_image(&idx, 100, 200, 3000).is_none(),
+            "两候选偏差相同应拒绝"
+        );
+        assert!(match_cached_image(&idx, 7, 7, 1000).is_none());
     }
 }
